@@ -5,8 +5,17 @@ import (
 	"code.google.com/p/go.crypto/ssh"
 	"fmt"
 	"io"
+	"math/rand"
+	"net"
 	"os"
 	"runtime"
+	"time"
+)
+
+var (
+	user        string
+	haveKeyring bool
+	keyring     ssh.ClientAuth
 )
 
 type (
@@ -49,37 +58,68 @@ func (t *MegaPassword) Password(user string) (password string, err error) {
 }
 
 func makeConfig() *ssh.ClientConfig {
-	var buf [4096]byte
+	clientAuth := []ssh.ClientAuth{}
+
+	sshAuthSock := os.Getenv("SSH_AUTH_SOCK")
+	if sshAuthSock != "" {
+		for {
+			sock, err := net.Dial("unix", sshAuthSock)
+			if err != nil {
+				netErr := err.(net.Error)
+				if netErr.Temporary() {
+					fmt.Fprintln(os.Stderr, "Got temporary error")
+					time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
+					continue
+				}
+
+				fmt.Fprintln(os.Stderr, "Cannot open connection to SSH agent: "+netErr.Error()+", is temporary: ", netErr.Temporary())
+			} else {
+				agent := ssh.NewAgentClient(sock)
+				clientAuth = append(clientAuth, ssh.ClientAuthAgent(agent))
+			}
+
+			break
+		}
+	}
+
+	if haveKeyring {
+		clientAuth = append(clientAuth, keyring)
+	}
+
+	return &ssh.ClientConfig{
+		User: user,
+		Auth: clientAuth,
+	}
+}
+
+func makeKeyring() (res ssh.ClientAuth, err error) {
+	var buf [16384]byte
 
 	keyname := os.Getenv("HOME") + "/.ssh/id_rsa"
 	fp, err := os.Open(keyname)
 	if err != nil {
-		panic("Cannot open " + keyname + ": " + err.Error())
+		return
 	}
 
 	n, err := fp.Read(buf[:])
 	if err != nil {
-		panic("Cannot read private key: " + err.Error())
+		return
 	}
 
 	signer, err := ssh.ParsePrivateKey(buf[0:n])
 	if err != nil {
-		panic("Cannot parse private key: " + err.Error())
+		return
 	}
 
-	return &ssh.ClientConfig{
-		User: os.Getenv("LOGNAME"),
-		Auth: []ssh.ClientAuth{
-			ssh.ClientAuthKeyring(&SignerContainer{[]ssh.Signer{signer}}),
-		},
-	}
+	res = ssh.ClientAuthKeyring(&SignerContainer{[]ssh.Signer{signer}})
+	return
 }
 
-func execute(config *ssh.ClientConfig, cmd string, hostname string) (result string, err error) {
+func execute(cmd string, hostname string) (result string, err error) {
 
-	fmt.Print("\rConnecting to " + hostname + "\r")
+	fmt.Fprint(os.Stderr, "\r\033[2KConnecting to "+hostname+"\r")
 
-	client, err := ssh.Dial("tcp", hostname+":22", config)
+	client, err := ssh.Dial("tcp", hostname+":22", makeConfig())
 	if err != nil {
 		return
 	}
@@ -90,7 +130,7 @@ func execute(config *ssh.ClientConfig, cmd string, hostname string) (result stri
 	}
 	defer session.Close()
 
-	fmt.Print("\rConnected to " + hostname + "\r")
+	fmt.Fprint(os.Stderr, "\r\033[2KConnected to "+hostname+"\r")
 
 	var b bytes.Buffer
 	session.Stdout = &b
@@ -103,13 +143,13 @@ func execute(config *ssh.ClientConfig, cmd string, hostname string) (result stri
 	return
 }
 
-func mssh(config *ssh.ClientConfig, cmd string, hostnames []string) (result map[string]string) {
+func mssh(cmd string, hostnames []string) (result map[string]string) {
 	result = make(map[string]string)
 	resultsChan := make(chan *SshResult, 10)
 
 	for _, hostname := range hostnames {
 		go func(host string) {
-			result, err := execute(config, cmd, host)
+			result, err := execute(cmd, host)
 			if err != nil {
 				fmt.Println("Error at " + host + ": " + err.Error())
 				result = "(error)\n"
@@ -128,15 +168,24 @@ func mssh(config *ssh.ClientConfig, cmd string, hostnames []string) (result map[
 }
 
 func main() {
+	var err error
+
 	if len(os.Args) < 3 {
 		fmt.Fprintln(os.Stderr, "Usage: mssh <cmd> <server1> [... <serverN>]")
 		os.Exit(2)
 	}
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
+	user = os.Getenv("LOGNAME")
 
-	config := makeConfig()
-	result := mssh(config, os.Args[1], os.Args[2:])
+	keyring, err = makeKeyring()
+	if err == nil {
+		haveKeyring = true
+	} else {
+		fmt.Fprintln(os.Stderr, "Cannot read private key: "+err.Error())
+	}
+
+	result := mssh(os.Args[1], os.Args[2:])
 
 	fmt.Println("\n")
 
