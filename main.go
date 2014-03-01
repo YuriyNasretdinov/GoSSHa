@@ -5,9 +5,11 @@ import (
 	"code.google.com/p/go.crypto/ssh"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"math/rand"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"time"
 )
@@ -30,6 +32,11 @@ type (
 	SshResult struct {
 		hostname string
 		result   string
+	}
+
+	ScpResult struct {
+		hostname string
+		err      error
 	}
 )
 
@@ -67,15 +74,19 @@ func makeConfig() *ssh.ClientConfig {
 			if err != nil {
 				netErr := err.(net.Error)
 				if netErr.Temporary() {
-					fmt.Fprintln(os.Stderr, "Got temporary error")
 					time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
 					continue
 				}
 
-				fmt.Fprintln(os.Stderr, "Cannot open connection to SSH agent: "+netErr.Error()+", is temporary: ", netErr.Temporary())
+				fmt.Fprintln(os.Stderr, "Cannot open connection to SSH agent: "+netErr.Error())
 			} else {
 				agent := ssh.NewAgentClient(sock)
-				clientAuth = append(clientAuth, ssh.ClientAuthAgent(agent))
+				identities, err := agent.RequestIdentities()
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "Cannot request identities from ssh-agent: "+err.Error())
+				} else if len(identities) > 0 {
+					clientAuth = append(clientAuth, ssh.ClientAuthAgent(agent))
+				}
 			}
 
 			break
@@ -93,20 +104,18 @@ func makeConfig() *ssh.ClientConfig {
 }
 
 func makeKeyring() (res ssh.ClientAuth, err error) {
-	var buf [16384]byte
-
 	keyname := os.Getenv("HOME") + "/.ssh/id_rsa"
 	fp, err := os.Open(keyname)
 	if err != nil {
 		return
 	}
 
-	n, err := fp.Read(buf[:])
+	buf, err := ioutil.ReadAll(fp)
 	if err != nil {
 		return
 	}
 
-	signer, err := ssh.ParsePrivateKey(buf[0:n])
+	signer, err := ssh.ParsePrivateKey(buf)
 	if err != nil {
 		return
 	}
@@ -115,8 +124,7 @@ func makeKeyring() (res ssh.ClientAuth, err error) {
 	return
 }
 
-func execute(cmd string, hostname string) (result string, err error) {
-
+func getSession(hostname string) (session *ssh.Session, err error) {
 	fmt.Fprint(os.Stderr, "\r\033[2KConnecting to "+hostname+"\r")
 
 	client, err := ssh.Dial("tcp", hostname+":22", makeConfig())
@@ -124,13 +132,54 @@ func execute(cmd string, hostname string) (result string, err error) {
 		return
 	}
 
-	session, err := client.NewSession()
+	session, err = client.NewSession()
+	if err == nil {
+		fmt.Fprint(os.Stderr, "\r\033[2KConnected to "+hostname+"\r")
+	}
+
+	return
+}
+
+func uploadFile(target string, contents []byte, hostname string) (err error) {
+	session, err := getSession(hostname)
 	if err != nil {
 		return
 	}
-	defer session.Close()
 
-	fmt.Fprint(os.Stderr, "\r\033[2KConnected to "+hostname+"\r")
+	cmd := "cat >" + target
+	stdinPipe, err := session.StdinPipe()
+	if err != nil {
+		return
+	}
+
+	err = session.Start(cmd)
+	if err != nil {
+		return
+	}
+
+	_, err = stdinPipe.Write(contents)
+	if err != nil {
+		return
+	}
+
+	err = stdinPipe.Close()
+	if err != nil {
+		return
+	}
+
+	err = session.Wait()
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func execute(cmd string, hostname string) (result string, err error) {
+	session, err := getSession(hostname)
+	if err != nil {
+		return
+	}
 
 	var b bytes.Buffer
 	session.Stdout = &b
@@ -167,13 +216,38 @@ func mssh(cmd string, hostnames []string) (result map[string]string) {
 	return
 }
 
-func main() {
-	var err error
-
-	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "Usage: mssh <cmd> <server1> [... <serverN>]")
-		os.Exit(2)
+func mscp(source, target string, hostnames []string) (result map[string]error) {
+	fp, err := os.Open(source)
+	if err != nil {
+		panic("Cannot open " + source + ": " + err.Error())
 	}
+
+	defer fp.Close()
+
+	contents, err := ioutil.ReadAll(fp)
+	if err != nil {
+		panic("Cannot read " + source + " contents: " + err.Error())
+	}
+
+	result = make(map[string]error)
+	resultsChan := make(chan *ScpResult, 10)
+
+	for _, hostname := range hostnames {
+		go func(host string) {
+			resultsChan <- &ScpResult{hostname: host, err: uploadFile(target, contents, host)}
+		}(hostname)
+	}
+
+	for i := 0; i < len(hostnames); i++ {
+		res := <-resultsChan
+		result[res.hostname] = res.err
+	}
+
+	return
+}
+
+func initialize() {
+	var err error
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	user = os.Getenv("LOGNAME")
@@ -184,12 +258,38 @@ func main() {
 	} else {
 		fmt.Fprintln(os.Stderr, "Cannot read private key: "+err.Error())
 	}
+}
 
-	result := mssh(os.Args[1], os.Args[2:])
+func main() {
+	command := filepath.Base(os.Args[0])
 
-	fmt.Println("\n")
+	if command == "mscp" {
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "Usage: mscp <source> <target> <server1> [... <serverN>]")
+			os.Exit(2)
+		}
 
-	for k, v := range result {
-		fmt.Print(k + ": " + v)
+		initialize()
+		result := mscp(os.Args[1], os.Args[2], os.Args[3:])
+
+		fmt.Println("\n")
+
+		for k, v := range result {
+			fmt.Println(k+": ", v)
+		}
+	} else {
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: mssh <cmd> <server1> [... <serverN>]")
+			os.Exit(2)
+		}
+
+		initialize()
+		result := mssh(os.Args[1], os.Args[2:])
+
+		fmt.Println("\n")
+
+		for k, v := range result {
+			fmt.Print(k + ": " + v)
+		}
 	}
 }
