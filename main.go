@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"time"
@@ -64,6 +65,10 @@ func (t *MegaPassword) Password(user string) (password string, err error) {
 	return
 }
 
+func reportErrorToUser(msg string) {
+	fmt.Fprintln(os.Stderr, msg)
+}
+
 func makeConfig() *ssh.ClientConfig {
 	clientAuth := []ssh.ClientAuth{}
 
@@ -93,7 +98,7 @@ func makeConfig() *ssh.ClientConfig {
 		}
 	}
 
-	if haveKeyring {
+	if keyring != nil {
 		clientAuth = append(clientAuth, keyring)
 	}
 
@@ -103,25 +108,100 @@ func makeConfig() *ssh.ClientConfig {
 	}
 }
 
-func makeKeyring() (res ssh.ClientAuth, err error) {
-	keyname := os.Getenv("HOME") + "/.ssh/id_rsa"
+func makeSigner(keyname string) (signer ssh.Signer, err error) {
 	fp, err := os.Open(keyname)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			reportErrorToUser("Could not parse " + keyname + ": " + err.Error())
+		}
 		return
 	}
+	defer fp.Close()
 
 	buf, err := ioutil.ReadAll(fp)
 	if err != nil {
+		reportErrorToUser("Could not read " + keyname + ": " + err.Error())
 		return
 	}
 
-	signer, err := ssh.ParsePrivateKey(buf)
+	if bytes.Contains(buf, []byte("ENCRYPTED")) {
+		var (
+			tmpfp *os.File
+			out   []byte
+		)
+
+		tmpfp, err = ioutil.TempFile("", "key")
+		if err != nil {
+			reportErrorToUser("Could not create temporary file: " + err.Error())
+			return
+		}
+
+		tmpName := tmpfp.Name()
+
+		defer func() { tmpfp.Close(); os.Remove(tmpName) }()
+
+		reportErrorToUser(keyname + " is encrypted, using ssh-keygen to decrypt it")
+
+		_, err = tmpfp.Write(buf)
+
+		if err != nil {
+			reportErrorToUser("Could not write encrypted key contents to temporary file: " + err.Error())
+			return
+		}
+
+		err = tmpfp.Close()
+		if err != nil {
+			reportErrorToUser("Could not close temporary file: " + err.Error())
+			return
+		}
+
+		cmd := exec.Command("ssh-keygen", "-f", tmpName, "-N", "", "-p")
+		out, err = cmd.CombinedOutput()
+		if err != nil {
+			reportErrorToUser("Could not decrypt key: " + err.Error() + ", command output: " + string(out))
+			return
+		}
+
+		tmpfp, err = os.Open(tmpName)
+		if err != nil {
+			reportErrorToUser("Cannot open back " + tmpName)
+			return
+		}
+
+		buf, err = ioutil.ReadAll(tmpfp)
+		if err != nil {
+			return
+		}
+
+		tmpfp.Close()
+		os.Remove(tmpName)
+	}
+
+	signer, err = ssh.ParsePrivateKey(buf)
 	if err != nil {
+		reportErrorToUser("Could not parse " + keyname + ": " + err.Error())
 		return
 	}
 
-	res = ssh.ClientAuthKeyring(&SignerContainer{[]ssh.Signer{signer}})
 	return
+}
+
+func makeKeyring() ssh.ClientAuth {
+	signers := []ssh.Signer{}
+	keys := []string{os.Getenv("HOME") + "/.ssh/id_rsa", os.Getenv("HOME") + "/.ssh/id_dsa"}
+
+	for _, keyname := range keys {
+		signer, err := makeSigner(keyname)
+		if err == nil {
+			signers = append(signers, signer)
+		}
+	}
+
+	if len(keys) == 0 {
+		return nil
+	}
+
+	return ssh.ClientAuthKeyring(&SignerContainer{signers})
 }
 
 func getSession(hostname string) (session *ssh.Session, err error) {
@@ -247,17 +327,10 @@ func mscp(source, target string, hostnames []string) (result map[string]error) {
 }
 
 func initialize() {
-	var err error
-
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	user = os.Getenv("LOGNAME")
 
-	keyring, err = makeKeyring()
-	if err == nil {
-		haveKeyring = true
-	} else {
-		fmt.Fprintln(os.Stderr, "Cannot read private key: "+err.Error())
-	}
+	keyring = makeKeyring()
 }
 
 func main() {
