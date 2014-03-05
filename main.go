@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"code.google.com/p/go.crypto/ssh"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -12,10 +13,14 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	DEFAULT_TIMEOUT = 30000 // default timeout for operations (in milliseconds)
 )
 
 var (
@@ -24,6 +29,8 @@ var (
 	keyring             ssh.ClientAuth
 	connectedHosts      map[string]*ssh.ClientConn
 	connectedHostsMutex sync.Mutex
+	repliesChan         chan interface{}
+	requestsChan        chan *ProxyRequest
 )
 
 type (
@@ -37,7 +44,8 @@ type (
 
 	SshResult struct {
 		hostname string
-		result   string
+		stdout   string
+		stderr   string
 		err      error
 	}
 
@@ -47,19 +55,28 @@ type (
 	}
 
 	ProxyRequest struct {
-		Action  string
-		Cmd     string
-		Hosts   []string
-		Timeout uint64
+		Action   string
+		Password string // password for private key (only for Action == "password")
+		Cmd      string // command to execute (only for Action == "ssh")
+		Source   string // source file to copy (only for Action == "scp")
+		Target   string // target file (only for Action == "scp")
+		Hosts    []string
+		Timeout  uint64
 	}
 
-	MsshReply struct {
+	Reply struct {
 		Hostname string
-		Result   string
-		Err      error
+		Stdout   string
+		Stderr   string
+		Success  bool
+		ErrMsg   string
 	}
 
-	MsshFinalReply struct {
+	PasswordRequest struct {
+		PasswordFor string
+	}
+
+	FinalReply struct {
 		TotalTime     float64
 		TimedOutHosts map[string]bool
 	}
@@ -67,6 +84,18 @@ type (
 	ConnectionProgress struct {
 		ConnectedHost string
 	}
+
+	UserError struct {
+		IsCritical bool
+		ErrorMsg   string
+	}
+
+	InitializeComplete struct {
+		InitializeComplete bool
+	}
+
+	DisableReportConnectedHosts bool
+	EnableReportConnectedHosts  bool
 )
 
 func (t *SignerContainer) Key(i int) (key ssh.PublicKey, err error) {
@@ -94,7 +123,11 @@ func (t *MegaPassword) Password(user string) (password string, err error) {
 }
 
 func reportErrorToUser(msg string) {
-	fmt.Fprintln(os.Stderr, msg)
+	repliesChan <- &UserError{ErrorMsg: msg}
+}
+
+func reportCriticalErrorToUser(msg string) {
+	repliesChan <- &UserError{IsCritical: true, ErrorMsg: msg}
 }
 
 func makeConfig() *ssh.ClientConfig {
@@ -111,12 +144,12 @@ func makeConfig() *ssh.ClientConfig {
 					continue
 				}
 
-				fmt.Fprintln(os.Stderr, "Cannot open connection to SSH agent: "+netErr.Error())
+				reportErrorToUser("Cannot open connection to SSH agent: " + netErr.Error())
 			} else {
 				agent := ssh.NewAgentClient(sock)
 				identities, err := agent.RequestIdentities()
 				if err != nil {
-					fmt.Fprintln(os.Stderr, "Cannot request identities from ssh-agent: "+err.Error())
+					reportErrorToUser("Cannot request identities from ssh-agent: " + err.Error())
 				} else if len(identities) > 0 {
 					clientAuth = append(clientAuth, ssh.ClientAuthAgent(agent))
 				}
@@ -126,7 +159,7 @@ func makeConfig() *ssh.ClientConfig {
 		}
 	}
 
-	if keyring != nil {
+	if haveKeyring {
 		clientAuth = append(clientAuth, keyring)
 	}
 
@@ -168,8 +201,6 @@ func makeSigner(keyname string) (signer ssh.Signer, err error) {
 
 		defer func() { tmpfp.Close(); os.Remove(tmpName) }()
 
-		reportErrorToUser(keyname + " is encrypted, using ssh-keygen to decrypt it")
-
 		_, err = tmpfp.Write(buf)
 
 		if err != nil {
@@ -183,10 +214,19 @@ func makeSigner(keyname string) (signer ssh.Signer, err error) {
 			return
 		}
 
-		cmd := exec.Command("ssh-keygen", "-f", tmpName, "-N", "", "-p")
+		repliesChan <- &PasswordRequest{PasswordFor: keyname}
+		response := <-requestsChan
+
+		if response.Password == "" {
+			reportErrorToUser("No passphase supplied in request for " + keyname)
+			err = errors.New("No passphare supplied")
+			return
+		}
+
+		cmd := exec.Command("ssh-keygen", "-f", tmpName, "-N", "", "-P", response.Password, "-p")
 		out, err = cmd.CombinedOutput()
 		if err != nil {
-			reportErrorToUser("Could not decrypt key: " + err.Error() + ", command output: " + string(out))
+			reportErrorToUser(strings.TrimSpace(string(out)))
 			return
 		}
 
@@ -214,7 +254,7 @@ func makeSigner(keyname string) (signer ssh.Signer, err error) {
 	return
 }
 
-func makeKeyring() ssh.ClientAuth {
+func makeKeyring() {
 	signers := []ssh.Signer{}
 	keys := []string{os.Getenv("HOME") + "/.ssh/id_rsa", os.Getenv("HOME") + "/.ssh/id_dsa"}
 
@@ -225,11 +265,12 @@ func makeKeyring() ssh.ClientAuth {
 		}
 	}
 
-	if len(keys) == 0 {
-		return nil
+	if len(signers) == 0 {
+		haveKeyring = false
+	} else {
+		haveKeyring = true
+		keyring = ssh.ClientAuthKeyring(&SignerContainer{signers})
 	}
-
-	return ssh.ClientAuthKeyring(&SignerContainer{signers})
 }
 
 func getConnection(hostname string) (conn *ssh.ClientConn, err error) {
@@ -240,6 +281,11 @@ func getConnection(hostname string) (conn *ssh.ClientConn, err error) {
 		return
 	}
 
+	defer func() {
+		if msg := recover(); msg != nil {
+			err = errors.New("Panic: " + fmt.Sprint(msg))
+		}
+	}()
 	conn, err = ssh.Dial("tcp", hostname+":22", makeConfig())
 	if err != nil {
 		return
@@ -254,7 +300,7 @@ func getConnection(hostname string) (conn *ssh.ClientConn, err error) {
 	return
 }
 
-func uploadFile(target string, contents []byte, hostname string) (err error) {
+func uploadFile(target string, contents []byte, hostname string) (stdout, stderr string, err error) {
 	conn, err := getConnection(hostname)
 	if err != nil {
 		return
@@ -272,6 +318,11 @@ func uploadFile(target string, contents []byte, hostname string) (err error) {
 		return
 	}
 
+	var stdoutBuf bytes.Buffer
+	var stderrBuf bytes.Buffer
+	session.Stdout = &stdoutBuf
+	session.Stderr = &stderrBuf
+
 	err = session.Start(cmd)
 	if err != nil {
 		return
@@ -288,14 +339,13 @@ func uploadFile(target string, contents []byte, hostname string) (err error) {
 	}
 
 	err = session.Wait()
-	if err != nil {
-		return
-	}
+	stdout = stdoutBuf.String()
+	stderr = stderrBuf.String()
 
 	return
 }
 
-func execute(cmd string, hostname string) (result string, err error) {
+func executeCmd(cmd string, hostname string) (stdout, stderr string, err error) {
 	conn, err := getConnection(hostname)
 	if err != nil {
 		return
@@ -307,68 +357,14 @@ func execute(cmd string, hostname string) (result string, err error) {
 	}
 	defer session.Close()
 
-	var b bytes.Buffer
-	session.Stdout = &b
+	var stdoutBuf bytes.Buffer
+	var stderrBuf bytes.Buffer
+	session.Stdout = &stdoutBuf
+	session.Stderr = &stderrBuf
 	err = session.Run(cmd)
-	defer session.Close()
-	if err != nil {
-		return
-	}
 
-	result = b.String()
-	return
-}
-
-func mssh(cmd string, hostnames []string) (result map[string]string) {
-	result = make(map[string]string)
-	resultsChan := make(chan *SshResult, 10)
-
-	for _, hostname := range hostnames {
-		go func(host string) {
-			result, err := execute(cmd, host)
-			if err != nil {
-				reportErrorToUser("Error at " + host + ": " + err.Error())
-				result = "(error)\n"
-			}
-
-			resultsChan <- &SshResult{hostname: host, result: result}
-		}(hostname)
-	}
-
-	for i := 0; i < len(hostnames); i++ {
-		res := <-resultsChan
-		result[res.hostname] = res.result
-	}
-
-	return
-}
-
-func mscp(source, target string, hostnames []string) (result map[string]error) {
-	fp, err := os.Open(source)
-	if err != nil {
-		panic("Cannot open " + source + ": " + err.Error())
-	}
-
-	defer fp.Close()
-
-	contents, err := ioutil.ReadAll(fp)
-	if err != nil {
-		panic("Cannot read " + source + " contents: " + err.Error())
-	}
-
-	result = make(map[string]error)
-	resultsChan := make(chan *ScpResult, 10)
-
-	for _, hostname := range hostnames {
-		go func(host string) {
-			resultsChan <- &ScpResult{hostname: host, err: uploadFile(target, contents, host)}
-		}(hostname)
-	}
-
-	for i := 0; i < len(hostnames); i++ {
-		res := <-resultsChan
-		result[res.hostname] = res.err
-	}
+	stdout = stdoutBuf.String()
+	stderr = stderrBuf.String()
 
 	return
 }
@@ -377,43 +373,119 @@ func initialize() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	user = os.Getenv("LOGNAME")
 
-	keyring = makeKeyring()
+	repliesChan = make(chan interface{})
+	requestsChan = make(chan *ProxyRequest)
+
+	go inputDecoder()
+	go jsonReplierThread()
+
+	makeKeyring()
 	connectedHosts = make(map[string]*ssh.ClientConn)
 }
 
-func sendProxyReply(response interface{}) {
-	buf, err := json.Marshal(response)
-	if err != nil {
-		panic("Could not marshal json reply: " + err.Error())
-	}
+func jsonReplierThread() {
+	connectionReporting := true
 
-	fmt.Println(string(buf))
+	for {
+		reply := <-repliesChan
+
+		switch reply.(type) {
+		case DisableReportConnectedHosts:
+			connectionReporting = false
+
+			continue
+
+		case EnableReportConnectedHosts:
+			connectionReporting = true
+			continue
+
+		case *ConnectionProgress:
+			if !connectionReporting {
+				continue
+			}
+		}
+
+		buf, err := json.Marshal(reply)
+		if err != nil {
+			panic("Could not marshal json reply: " + err.Error())
+		}
+
+		fmt.Println(string(buf))
+	}
 }
 
-func runMsshAction(msg *ProxyRequest) {
-	if msg.Cmd == "" {
-		reportErrorToUser("Empty 'cmd'")
-		return
+func sendProxyReply(response interface{}) {
+	repliesChan <- response
+}
+
+func debug(msg string) {
+	fmt.Fprintln(os.Stderr, msg)
+}
+
+func runAction(msg *ProxyRequest) {
+	var executeFunc func(string) *SshResult
+
+	if msg.Action == "ssh" {
+		if msg.Cmd == "" {
+			reportCriticalErrorToUser("Empty 'Cmd'")
+			return
+		}
+
+		executeFunc = func(hostname string) *SshResult {
+			stdout, stderr, err := executeCmd(msg.Cmd, hostname)
+			return &SshResult{hostname: hostname, stdout: stdout, stderr: stderr, err: err}
+		}
+	} else if msg.Action == "scp" {
+		if msg.Source == "" {
+			reportCriticalErrorToUser("Empty 'Source'")
+			return
+		}
+
+		if msg.Target == "" {
+			reportCriticalErrorToUser("Empty 'Target'")
+			return
+		}
+
+		fp, err := os.Open(msg.Source)
+		if err != nil {
+			reportCriticalErrorToUser(err.Error())
+			return
+		}
+
+		defer fp.Close()
+
+		contents, err := ioutil.ReadAll(fp)
+		if err != nil {
+			reportCriticalErrorToUser("Cannot read " + msg.Source + " contents: " + err.Error())
+			return
+		}
+
+		executeFunc = func(hostname string) *SshResult {
+			stdout, stderr, err := uploadFile(msg.Target, contents, hostname)
+			return &SshResult{hostname: hostname, stdout: stdout, stderr: stderr, err: err}
+		}
 	}
 
-	if msg.Timeout == 0 {
-		reportErrorToUser("Empty 'Timeout'")
-		return
+	timeout := uint64(DEFAULT_TIMEOUT)
+
+	if msg.Timeout > 0 {
+		timeout = msg.Timeout
 	}
 
 	startTime := time.Now().UnixNano()
 
 	responseChannel := make(chan *SshResult, 10)
-	timeoutChannel := time.After(time.Millisecond * time.Duration(msg.Timeout))
+	timeoutChannel := time.After(time.Millisecond * time.Duration(timeout))
 
 	timedOutHosts := make(map[string]bool)
+
+	sendProxyReply(EnableReportConnectedHosts(true))
 
 	for _, hostname := range msg.Hosts {
 		timedOutHosts[hostname] = true
 
 		go func(host string) {
-			res, err := execute(msg.Cmd, host)
-			responseChannel <- &SshResult{hostname: host, result: res, err: err}
+			responseChannel <- executeFunc(host)
 		}(hostname)
 	}
 
@@ -426,7 +498,13 @@ func runMsshAction(msg *ProxyRequest) {
 			break
 		case msg := <-responseChannel:
 			delete(timedOutHosts, msg.hostname)
-			sendProxyReply(MsshReply{Hostname: msg.hostname, Result: msg.result, Err: msg.err})
+			success := true
+			errMsg := ""
+			if msg.err != nil {
+				errMsg = msg.err.Error()
+				success = false
+			}
+			sendProxyReply(Reply{Hostname: msg.hostname, Stdout: msg.stdout, Stderr: msg.stderr, ErrMsg: errMsg, Success: success})
 		}
 
 		if stop {
@@ -440,10 +518,12 @@ func runMsshAction(msg *ProxyRequest) {
 	}
 	connectedHostsMutex.Unlock()
 
-	sendProxyReply(MsshFinalReply{TotalTime: float64(time.Now().UnixNano()-startTime) / 1e9, TimedOutHosts: timedOutHosts})
+	sendProxyReply(DisableReportConnectedHosts(true))
+
+	sendProxyReply(FinalReply{TotalTime: float64(time.Now().UnixNano()-startTime) / 1e9, TimedOutHosts: timedOutHosts})
 }
 
-func runProxy() {
+func inputDecoder() {
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		msg := new(ProxyRequest)
@@ -451,57 +531,33 @@ func runProxy() {
 		line := scanner.Bytes()
 		err := json.Unmarshal(line, msg)
 		if err != nil {
-			reportErrorToUser("Cannot parse JSON: " + err.Error())
+			reportCriticalErrorToUser("Cannot parse JSON: " + err.Error())
 			continue
 		}
 
-		switch {
-		case msg.Action == "mssh":
-			runMsshAction(msg)
-		default:
-			reportErrorToUser("Unsupported action: " + msg.Action)
-		}
+		requestsChan <- msg
 	}
 
 	if err := scanner.Err(); err != nil {
-		reportErrorToUser("Error reading stdin: " + err.Error())
+		reportCriticalErrorToUser("Error reading stdin: " + err.Error())
+	}
+
+	close(requestsChan)
+}
+
+func runProxy() {
+	for msg := range requestsChan {
+		switch {
+		case msg.Action == "ssh" || msg.Action == "scp":
+			runAction(msg)
+		default:
+			reportCriticalErrorToUser("Unsupported action: " + msg.Action)
+		}
 	}
 }
 
 func main() {
-	command := filepath.Base(os.Args[0])
-
-	if command == "mscp" {
-		if len(os.Args) < 4 {
-			fmt.Fprintln(os.Stderr, "Usage: mscp <source> <target> <server1> [... <serverN>]")
-			os.Exit(2)
-		}
-
-		initialize()
-		result := mscp(os.Args[1], os.Args[2], os.Args[3:])
-
-		fmt.Println("\n")
-
-		for k, v := range result {
-			fmt.Println(k+": ", v)
-		}
-	} else if command == "mssh" {
-		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "Usage: mssh <cmd> <server1> [... <serverN>]")
-			os.Exit(2)
-		}
-
-		initialize()
-		result := mssh(os.Args[1], os.Args[2:])
-
-		fmt.Println("\n")
-
-		for k, v := range result {
-			fmt.Print(k + ": " + v)
-		}
-	} else {
-		initialize()
-
-		runProxy()
-	}
+	initialize()
+	sendProxyReply(&InitializeComplete{InitializeComplete: true})
+	runProxy()
 }
