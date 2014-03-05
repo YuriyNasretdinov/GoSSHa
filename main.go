@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"code.google.com/p/go.crypto/ssh"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -12,13 +14,16 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 )
 
 var (
-	user        string
-	haveKeyring bool
-	keyring     ssh.ClientAuth
+	user                string
+	haveKeyring         bool
+	keyring             ssh.ClientAuth
+	connectedHosts      map[string]*ssh.ClientConn
+	connectedHostsMutex sync.Mutex
 )
 
 type (
@@ -33,11 +38,34 @@ type (
 	SshResult struct {
 		hostname string
 		result   string
+		err      error
 	}
 
 	ScpResult struct {
 		hostname string
 		err      error
+	}
+
+	ProxyRequest struct {
+		Action  string
+		Cmd     string
+		Hosts   []string
+		Timeout uint64
+	}
+
+	MsshReply struct {
+		Hostname string
+		Result   string
+		Err      error
+	}
+
+	MsshFinalReply struct {
+		TotalTime     float64
+		TimedOutHosts map[string]bool
+	}
+
+	ConnectionProgress struct {
+		ConnectedHost string
 	}
 )
 
@@ -204,27 +232,39 @@ func makeKeyring() ssh.ClientAuth {
 	return ssh.ClientAuthKeyring(&SignerContainer{signers})
 }
 
-func getSession(hostname string) (session *ssh.Session, err error) {
-	fmt.Fprint(os.Stderr, "\r\033[2KConnecting to "+hostname+"\r")
+func getConnection(hostname string) (conn *ssh.ClientConn, err error) {
+	connectedHostsMutex.Lock()
+	conn = connectedHosts[hostname]
+	connectedHostsMutex.Unlock()
+	if conn != nil {
+		return
+	}
 
-	client, err := ssh.Dial("tcp", hostname+":22", makeConfig())
+	conn, err = ssh.Dial("tcp", hostname+":22", makeConfig())
 	if err != nil {
 		return
 	}
 
-	session, err = client.NewSession()
-	if err == nil {
-		fmt.Fprint(os.Stderr, "\r\033[2KConnected to "+hostname+"\r")
-	}
+	sendProxyReply(&ConnectionProgress{ConnectedHost: hostname})
+
+	connectedHostsMutex.Lock()
+	connectedHosts[hostname] = conn
+	connectedHostsMutex.Unlock()
 
 	return
 }
 
 func uploadFile(target string, contents []byte, hostname string) (err error) {
-	session, err := getSession(hostname)
+	conn, err := getConnection(hostname)
 	if err != nil {
 		return
 	}
+
+	session, err := conn.NewSession()
+	if err != nil {
+		return
+	}
+	defer session.Close()
 
 	cmd := "cat >" + target
 	stdinPipe, err := session.StdinPipe()
@@ -256,14 +296,21 @@ func uploadFile(target string, contents []byte, hostname string) (err error) {
 }
 
 func execute(cmd string, hostname string) (result string, err error) {
-	session, err := getSession(hostname)
+	conn, err := getConnection(hostname)
 	if err != nil {
 		return
 	}
 
+	session, err := conn.NewSession()
+	if err != nil {
+		return
+	}
+	defer session.Close()
+
 	var b bytes.Buffer
 	session.Stdout = &b
 	err = session.Run(cmd)
+	defer session.Close()
 	if err != nil {
 		return
 	}
@@ -280,7 +327,7 @@ func mssh(cmd string, hostnames []string) (result map[string]string) {
 		go func(host string) {
 			result, err := execute(cmd, host)
 			if err != nil {
-				fmt.Println("Error at " + host + ": " + err.Error())
+				reportErrorToUser("Error at " + host + ": " + err.Error())
 				result = "(error)\n"
 			}
 
@@ -331,6 +378,94 @@ func initialize() {
 	user = os.Getenv("LOGNAME")
 
 	keyring = makeKeyring()
+	connectedHosts = make(map[string]*ssh.ClientConn)
+}
+
+func sendProxyReply(response interface{}) {
+	buf, err := json.Marshal(response)
+	if err != nil {
+		panic("Could not marshal json reply: " + err.Error())
+	}
+
+	fmt.Println(string(buf))
+}
+
+func runMsshAction(msg *ProxyRequest) {
+	if msg.Cmd == "" {
+		reportErrorToUser("Empty 'cmd'")
+		return
+	}
+
+	if msg.Timeout == 0 {
+		reportErrorToUser("Empty 'Timeout'")
+		return
+	}
+
+	startTime := time.Now().UnixNano()
+
+	responseChannel := make(chan *SshResult, 10)
+	timeoutChannel := time.After(time.Millisecond * time.Duration(msg.Timeout))
+
+	timedOutHosts := make(map[string]bool)
+
+	for _, hostname := range msg.Hosts {
+		timedOutHosts[hostname] = true
+
+		go func(host string) {
+			res, err := execute(msg.Cmd, host)
+			responseChannel <- &SshResult{hostname: host, result: res, err: err}
+		}(hostname)
+	}
+
+	stop := false
+
+	for i := 0; i < len(msg.Hosts); i++ {
+		select {
+		case <-timeoutChannel:
+			stop = true
+			break
+		case msg := <-responseChannel:
+			delete(timedOutHosts, msg.hostname)
+			sendProxyReply(MsshReply{Hostname: msg.hostname, Result: msg.result, Err: msg.err})
+		}
+
+		if stop {
+			break
+		}
+	}
+
+	connectedHostsMutex.Lock()
+	for hostname, _ := range timedOutHosts {
+		delete(connectedHosts, hostname)
+	}
+	connectedHostsMutex.Unlock()
+
+	sendProxyReply(MsshFinalReply{TotalTime: float64(time.Now().UnixNano()-startTime) / 1e9, TimedOutHosts: timedOutHosts})
+}
+
+func runProxy() {
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		msg := new(ProxyRequest)
+
+		line := scanner.Bytes()
+		err := json.Unmarshal(line, msg)
+		if err != nil {
+			reportErrorToUser("Cannot parse JSON: " + err.Error())
+			continue
+		}
+
+		switch {
+		case msg.Action == "mssh":
+			runMsshAction(msg)
+		default:
+			reportErrorToUser("Unsupported action: " + msg.Action)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		reportErrorToUser("Error reading stdin: " + err.Error())
+	}
 }
 
 func main() {
@@ -350,7 +485,7 @@ func main() {
 		for k, v := range result {
 			fmt.Println(k+": ", v)
 		}
-	} else {
+	} else if command == "mssh" {
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stderr, "Usage: mssh <cmd> <server1> [... <serverN>]")
 			os.Exit(2)
@@ -364,5 +499,9 @@ func main() {
 		for k, v := range result {
 			fmt.Print(k + ": " + v)
 		}
+	} else {
+		initialize()
+
+		runProxy()
 	}
 }
