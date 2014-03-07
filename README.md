@@ -7,11 +7,7 @@ Installation
 ============
 
 1. Install go (programming language) at http://golang.org/
-2. Install GoSSHa:
-
-```
-$ go get github.com/YuriyNasretdinov/GoSSHa
-```
+2. Install GoSSHa: `$ go get github.com/YuriyNasretdinov/GoSSHa`
 
 Usage
 =====
@@ -61,6 +57,12 @@ If critical error occurs then all pending operations will be aborted and you wil
 
 ```
 {"IsCritical":true,"ErrorMsg":"Cannot parse JSON: unexpected end of JSON input"}
+```
+
+When GoSSHa finishes initialization and is ready to accept commands, the following line will be printed:
+
+```
+{"InitializeComplete":true}
 ```
 
 ## Commands execution
