@@ -79,7 +79,11 @@ While connections to hosts are estabilished and command results are ready you wi
 
 1. Error messages: `{"IsCritical":false,"ErrorMsg":"<error-message>"}`
 2. Connection progress: `{"ConnectedHost":"<hostname>"}`
-3. Command result: `{"Hostname":"<hostname>","Stdout":"<command-stdout>","Stderr":"<command-stderr>","Success":true|false,"ErrMsg":"<error message>"}`
+3. Command result:
+
+```
+{"Hostname":"<hostname>","Stdout":"<command-stdout>","Stderr":"<command-stderr>","Success":true|false,"ErrMsg":"<error message>"}
+```
 
 After all commands have done executing or when timeout comes you will receive the following response:
 
