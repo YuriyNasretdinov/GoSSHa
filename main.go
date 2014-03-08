@@ -489,13 +489,10 @@ func runAction(msg *ProxyRequest) {
 		}(hostname)
 	}
 
-	stop := false
-
 	for i := 0; i < len(msg.Hosts); i++ {
 		select {
 		case <-timeoutChannel:
-			stop = true
-			break
+			goto finish
 		case msg := <-responseChannel:
 			delete(timedOutHosts, msg.hostname)
 			success := true
@@ -506,14 +503,16 @@ func runAction(msg *ProxyRequest) {
 			}
 			sendProxyReply(Reply{Hostname: msg.hostname, Stdout: msg.stdout, Stderr: msg.stderr, ErrMsg: errMsg, Success: success})
 		}
-
-		if stop {
-			break
-		}
 	}
+
+finish:
 
 	connectedHostsMutex.Lock()
 	for hostname, _ := range timedOutHosts {
+		if conn, ok := connectedHosts[hostname]; ok {
+			conn.Close()
+		}
+
 		delete(connectedHosts, hostname)
 	}
 	connectedHostsMutex.Unlock()
