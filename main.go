@@ -361,9 +361,10 @@ func executeCmd(cmd string, hostname string) (stdout, stderr string, err error) 
 func initialize() {
 	var pubKey string
 	flag.StringVar(&pubKey, "i", "", "Optional path to public key to use")
+	flag.StringVar(&user, "l", os.Getenv("LOGNAME"), "Optional login name")
 	flag.Parse()
 
-	keys = []string{os.Getenv("HOME") + "/.ssh/id_rsa", os.Getenv("HOME") + "/.ssh/id_dsa"}
+	keys = []string{os.Getenv("HOME") + "/.ssh/id_rsa", os.Getenv("HOME") + "/.ssh/id_dsa", os.Getenv("HOME") + "/.ssh/id_ecdsa"}
 
 	if pubKey != "" {
 		if strings.HasSuffix(pubKey, ".pub") {
@@ -374,7 +375,6 @@ func initialize() {
 	}
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
-	user = os.Getenv("LOGNAME")
 
 	repliesChan = make(chan interface{})
 	requestsChan = make(chan *ProxyRequest)
