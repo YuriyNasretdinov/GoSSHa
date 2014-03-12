@@ -6,6 +6,7 @@ import (
 	"code.google.com/p/go.crypto/ssh"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -31,6 +32,7 @@ var (
 	connectedHostsMutex sync.Mutex
 	repliesChan         chan interface{}
 	requestsChan        chan *ProxyRequest
+	keys                []string
 )
 
 type (
@@ -256,7 +258,6 @@ func makeSigner(keyname string) (signer ssh.Signer, err error) {
 
 func makeKeyring() {
 	signers := []ssh.Signer{}
-	keys := []string{os.Getenv("HOME") + "/.ssh/id_rsa", os.Getenv("HOME") + "/.ssh/id_dsa"}
 
 	for _, keyname := range keys {
 		signer, err := makeSigner(keyname)
@@ -370,6 +371,20 @@ func executeCmd(cmd string, hostname string) (stdout, stderr string, err error) 
 }
 
 func initialize() {
+	var pubKey string
+	flag.StringVar(&pubKey, "i", "", "Optional path to public key to use")
+	flag.Parse()
+
+	keys = []string{os.Getenv("HOME") + "/.ssh/id_rsa", os.Getenv("HOME") + "/.ssh/id_dsa"}
+
+	if pubKey != "" {
+		if strings.HasSuffix(pubKey, ".pub") {
+			pubKey = strings.TrimSuffix(pubKey, ".pub")
+		}
+
+		keys = append(keys, pubKey)
+	}
+
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	user = os.Getenv("LOGNAME")
 
