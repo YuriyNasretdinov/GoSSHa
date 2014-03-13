@@ -309,7 +309,7 @@ func uploadFile(target string, contents []byte, hostname string) (stdout, stderr
 	}
 	defer session.Close()
 
-	cmd := "cat >" + target
+	cmd := "cat >'" + strings.Replace(target, "'", "'\\''", -1) + "'"
 	stdinPipe, err := session.StdinPipe()
 	if err != nil {
 		return
