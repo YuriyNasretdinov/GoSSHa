@@ -21,11 +21,12 @@ import (
 )
 
 const (
-	DEFAULT_TIMEOUT           = 30000 // default timeout for operations (in milliseconds)
-	CHUNK_SIZE                = 65536 // chunk size in bytes for scp
-	THROUGHPUT_SLEEP_INTERVAL = 100   // how many milliseconds to sleep between writing "tickets" to channel in maxThroughputThread
-	MIN_CHUNKS                = 10    // minimum allowed count of chunks to be sent per sleep interval
-	MIN_THROUGHPUT            = CHUNK_SIZE * MIN_CHUNKS * (1000 / THROUGHPUT_SLEEP_INTERVAL)
+	DEFAULT_TIMEOUT               = 30000 // default timeout for operations (in milliseconds)
+	CHUNK_SIZE                    = 65536 // chunk size in bytes for scp
+	THROUGHPUT_SLEEP_INTERVAL     = 100   // how many milliseconds to sleep between writing "tickets" to channel in maxThroughputThread
+	MIN_CHUNKS                    = 10    // minimum allowed count of chunks to be sent per sleep interval
+	MIN_THROUGHPUT                = CHUNK_SIZE * MIN_CHUNKS * (1000 / THROUGHPUT_SLEEP_INTERVAL)
+	MAX_OPENSSH_AGENT_CONNECTIONS = 128 // default connection backlog for openssh
 )
 
 var (
@@ -39,6 +40,9 @@ var (
 	maxThroughputChan   = make(chan bool, MIN_CHUNKS) // channel that is used for throughput limiting in scp
 	maxThroughput       uint64                        // max throughput (for scp) in bytes per second
 	maxThroughputMutex  sync.Mutex
+	agentConnChan       = make(chan chan bool) // channel for getting "ticket" for new agent connection
+	agentConnFreeChan   = make(chan bool, 10)  // channel for freeing connections
+	sshAuthSock         string
 )
 
 type (
@@ -132,18 +136,33 @@ func reportCriticalErrorToUser(msg string) {
 	repliesChan <- &UserError{IsCritical: true, ErrorMsg: msg}
 }
 
-func makeConfig() *ssh.ClientConfig {
+func waitAgent() {
+	if sshAuthSock != "" {
+		respChan := make(chan bool)
+		agentConnChan <- respChan
+		<-respChan
+	}
+}
+
+func releaseAgent() {
+	if sshAuthSock != "" {
+		agentConnFreeChan <- true
+	}
+}
+
+func makeConfig() (config *ssh.ClientConfig, agentUnixSock net.Conn) {
 	clientAuth := []ssh.ClientAuth{}
 
 	var (
 		agentKr ssh.ClientKeyring
 		ok      bool
+		err     error
 	)
 
-	sshAuthSock := os.Getenv("SSH_AUTH_SOCK")
 	if sshAuthSock != "" {
 		for {
-			sock, err := net.Dial("unix", sshAuthSock)
+			agentUnixSock, err = net.Dial("unix", sshAuthSock)
+
 			if err != nil {
 				netErr := err.(net.Error)
 				if netErr.Temporary() {
@@ -153,7 +172,7 @@ func makeConfig() *ssh.ClientConfig {
 
 				reportErrorToUser("Cannot open connection to SSH agent: " + netErr.Error())
 			} else {
-				authAgent := ssh.ClientAuthAgent(ssh.NewAgentClient(sock))
+				authAgent := ssh.ClientAuthAgent(ssh.NewAgentClient(agentUnixSock))
 				agentKr, ok = authAgent.(ssh.ClientKeyring)
 				if !ok {
 					reportErrorToUser("Type assertion failed: ssh.ClientAuthAgent no longer returns ssh.ClientKeyring, using fallback")
@@ -168,10 +187,12 @@ func makeConfig() *ssh.ClientConfig {
 	keyring := ssh.ClientAuthKeyring(&SignerContainer{signers, agentKr})
 	clientAuth = append(clientAuth, keyring)
 
-	return &ssh.ClientConfig{
+	config = &ssh.ClientConfig{
 		User: user,
 		Auth: clientAuth,
 	}
+
+	return
 }
 
 func makeSigner(keyname string) (signer ssh.Signer, err error) {
@@ -223,8 +244,8 @@ func makeSigner(keyname string) (signer ssh.Signer, err error) {
 		response := <-requestsChan
 
 		if response.Password == "" {
-			reportErrorToUser("No passphase supplied in request for " + keyname)
-			err = errors.New("No passphare supplied")
+			reportErrorToUser("No passphrase supplied in request for " + keyname)
+			err = errors.New("No passphrase supplied")
 			return
 		}
 
@@ -283,7 +304,16 @@ func getConnection(hostname string) (conn *ssh.ClientConn, err error) {
 			err = errors.New("Panic: " + fmt.Sprint(msg))
 		}
 	}()
-	conn, err = ssh.Dial("tcp", hostname+":22", makeConfig())
+
+	waitAgent()
+	conf, agentConn := makeConfig()
+	if agentConn != nil {
+		defer agentConn.Close()
+	}
+
+	defer releaseAgent()
+
+	conn, err = ssh.Dial("tcp", hostname+":22", conf)
 	if err != nil {
 		return
 	}
@@ -374,10 +404,39 @@ func executeCmd(cmd string, hostname string) (stdout, stderr string, err error) 
 	return
 }
 
+// do not allow more than maxConn simultaneous ssh-agent connections
+func agentConnectionManagerThread(maxConn int) {
+	freeConn := maxConn // free connections count
+
+	for {
+		reqCh := agentConnChan
+		freeCh := agentConnFreeChan
+
+		if freeConn <= 0 {
+			reqCh = nil
+		}
+
+		// fmt.Fprintln(os.Stderr, "Free connections: ", freeConn)
+
+		select {
+		case respChan := <-reqCh:
+			freeConn--
+			respChan <- true
+		case <-freeCh:
+			freeConn++
+		}
+	}
+}
+
 func initialize() {
-	var pubKey string
+	var (
+		pubKey              string
+		maxAgentConnections int
+	)
+
 	flag.StringVar(&pubKey, "i", "", "Optional path to public key to use")
 	flag.StringVar(&user, "l", os.Getenv("LOGNAME"), "Optional login name")
+	flag.IntVar(&maxAgentConnections, "c", MAX_OPENSSH_AGENT_CONNECTIONS, "Maximum simultaneous ssh-agent connections")
 	flag.Parse()
 
 	keys = []string{os.Getenv("HOME") + "/.ssh/id_rsa", os.Getenv("HOME") + "/.ssh/id_dsa", os.Getenv("HOME") + "/.ssh/id_ecdsa"}
@@ -390,7 +449,13 @@ func initialize() {
 		keys = append(keys, pubKey)
 	}
 
+	sshAuthSock = os.Getenv("SSH_AUTH_SOCK")
+
 	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	if sshAuthSock != "" {
+		go agentConnectionManagerThread(maxAgentConnections)
+	}
 
 	go inputDecoder()
 	go jsonReplierThread()
