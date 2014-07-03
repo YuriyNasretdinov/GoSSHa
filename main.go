@@ -3,7 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"code.google.com/p/go.crypto/ssh"
+	"code.google.com/p/gosshold/ssh"
 	"encoding/json"
 	"errors"
 	"flag"
