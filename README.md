@@ -33,7 +33,7 @@ GoSSHa continiously reads stdin and writes response to stdout. The protocol can 
 
 ## Initialization
 
-To be able to run commands GoSSHa examines `~/.ssh/id_rsa` and `~/.ssh/id_dsa` if present and asks for their passwords if they are encrypted. If ssh-agent auth socket is present (identified by presence of `SSH_AUTH_SOCK` environment variable) then it is used as a primary authentication method with fallback to private keys. Password or keyboard-interactive authentication methods are not currently supported, but there are no technical difficulties for adding them.
+To be able to run commands GoSSHa examines `~/.ssh/id_rsa`, `~/.ssh/id_dsa` and `~/.ssh/id_ecdsa` if present and asks for their passwords if they are encrypted. If ssh-agent auth socket is present (identified by presence of `SSH_AUTH_SOCK` environment variable) then it is used as a primary authentication method with fallback to private keys. Password or keyboard-interactive authentication methods are not currently supported, but there are no technical difficulties for adding them.
 
 During initialization, GoSSHa will ask for password for all encrypted private keys it finds, printing message in the following format:
 
@@ -67,10 +67,10 @@ When GoSSHa finishes initialization and is ready to accept commands, the followi
 
 ## Commands execution
 
-In order to execute a certain `<command>` on remote servers (e.g. `<server1>` and `<server2>`):
+In order to execute a certain `<command>` on remote servers (e.g. `<server1>` and `<server2>:<port2>`):
 
 ```
-{"Action":"ssh","Cmd":"<command>","Hosts":["<server1>","<server2>"]}
+{"Action":"ssh","Cmd":"<command>","Hosts":["<server1>","<server2>:<port2>"]}
 ```
 
 You can also set `"Timeout": <timeout>` in milliseconds (default is 30000 ms)
