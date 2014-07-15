@@ -313,7 +313,14 @@ func getConnection(hostname string) (conn *ssh.ClientConn, err error) {
 
 	defer releaseAgent()
 
-	conn, err = ssh.Dial("tcp", hostname+":22", conf)
+	port := "22"
+	str := strings.SplitN(hostname, ":", 2)
+	if len(str) == 2 {
+		hostname = str[0]
+		port = str[1]
+	}
+
+	conn, err = ssh.Dial("tcp", hostname+":"+port, conf)
 	if err != nil {
 		return
 	}
