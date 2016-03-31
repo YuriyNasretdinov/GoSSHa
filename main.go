@@ -3,12 +3,10 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"code.google.com/p/gosshold/ssh"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"math/rand"
 	"net"
@@ -18,6 +16,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 )
 
 const (
@@ -33,7 +34,7 @@ var (
 	user                string
 	signers             []ssh.Signer
 	keys                []string
-	connectedHosts      map[string]*ssh.ClientConn
+	connectedHosts      map[string]*ssh.Client
 	connectedHostsMutex sync.Mutex
 	repliesChan         = make(chan interface{})
 	requestsChan        = make(chan *ProxyRequest)
@@ -46,11 +47,6 @@ var (
 )
 
 type (
-	SignerContainer struct {
-		signers []ssh.Signer
-		agentKr ssh.ClientKeyring
-	}
-
 	SshResult struct {
 		hostname string
 		stdout   string
@@ -108,26 +104,6 @@ type (
 	EnableReportConnectedHosts  bool
 )
 
-func (t *SignerContainer) Key(i int) (key ssh.PublicKey, err error) {
-	if i < len(t.signers) {
-		key = t.signers[i].PublicKey()
-	} else if t.agentKr != nil {
-		key, err = t.agentKr.Key(i - len(t.signers))
-	}
-
-	return
-}
-
-func (t *SignerContainer) Sign(i int, rand io.Reader, data []byte) (sig []byte, err error) {
-	if i < len(t.signers) {
-		sig, err = t.signers[i].Sign(rand, data)
-	} else if t.agentKr != nil {
-		sig, err = t.agentKr.Sign(i-len(t.signers), rand, data)
-	}
-
-	return
-}
-
 func reportErrorToUser(msg string) {
 	repliesChan <- &UserError{ErrorMsg: msg}
 }
@@ -151,13 +127,9 @@ func releaseAgent() {
 }
 
 func makeConfig() (config *ssh.ClientConfig, agentUnixSock net.Conn) {
-	clientAuth := []ssh.ClientAuth{}
+	clientAuth := []ssh.AuthMethod{}
 
-	var (
-		agentKr ssh.ClientKeyring
-		ok      bool
-		err     error
-	)
+	var err error
 
 	if sshAuthSock != "" {
 		for {
@@ -172,20 +144,13 @@ func makeConfig() (config *ssh.ClientConfig, agentUnixSock net.Conn) {
 
 				reportErrorToUser("Cannot open connection to SSH agent: " + netErr.Error())
 			} else {
-				authAgent := ssh.ClientAuthAgent(ssh.NewAgentClient(agentUnixSock))
-				agentKr, ok = authAgent.(ssh.ClientKeyring)
-				if !ok {
-					reportErrorToUser("Type assertion failed: ssh.ClientAuthAgent no longer returns ssh.ClientKeyring, using fallback")
-					clientAuth = append(clientAuth, authAgent)
-				}
+				authAgent := ssh.PublicKeysCallback(agent.NewClient(agentUnixSock).Signers)
+				clientAuth = append(clientAuth, authAgent)
 			}
 
 			break
 		}
 	}
-
-	keyring := ssh.ClientAuthKeyring(&SignerContainer{signers, agentKr})
-	clientAuth = append(clientAuth, keyring)
 
 	config = &ssh.ClientConfig{
 		User: user,
@@ -291,7 +256,7 @@ func makeSigners() {
 	}
 }
 
-func getConnection(hostname string) (conn *ssh.ClientConn, err error) {
+func getConnection(hostname string) (conn *ssh.Client, err error) {
 	connectedHostsMutex.Lock()
 	conn = connectedHosts[hostname]
 	connectedHostsMutex.Unlock()
@@ -469,7 +434,7 @@ func initialize() {
 	go maxThroughputThread()
 
 	makeSigners()
-	connectedHosts = make(map[string]*ssh.ClientConn)
+	connectedHosts = make(map[string]*ssh.Client)
 }
 
 func jsonReplierThread() {
