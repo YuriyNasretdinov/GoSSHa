@@ -152,6 +152,10 @@ func makeConfig() (config *ssh.ClientConfig, agentUnixSock net.Conn) {
 		}
 	}
 
+	if len(signers) > 0 {
+		clientAuth = append(clientAuth, ssh.PublicKeys(signers...))
+	}
+
 	config = &ssh.ClientConfig{
 		User: user,
 		Auth: clientAuth,
