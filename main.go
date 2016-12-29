@@ -48,6 +48,7 @@ var (
 
 type (
 	SshResult struct {
+		id       string
 		hostname string
 		stdout   string
 		stderr   string
@@ -55,11 +56,13 @@ type (
 	}
 
 	ScpResult struct {
+		id       string
 		hostname string
 		err      error
 	}
 
 	ProxyRequest struct {
+		ID            string
 		Action        string
 		Password      string // password for private key (only for Action == "password")
 		Cmd           string // command to execute (only for Action == "ssh")
@@ -71,6 +74,7 @@ type (
 	}
 
 	Reply struct {
+		ID       string `json:"Id,omitempty"`
 		Hostname string
 		Stdout   string
 		Stderr   string
@@ -519,7 +523,7 @@ func runAction(msg *ProxyRequest) {
 
 		executeFunc = func(hostname string) *SshResult {
 			stdout, stderr, err := executeCmd(msg.Cmd, hostname)
-			return &SshResult{hostname: hostname, stdout: stdout, stderr: stderr, err: err}
+			return &SshResult{id: msg.ID, hostname: hostname, stdout: stdout, stderr: stderr, err: err}
 		}
 	} else if msg.Action == "scp" {
 		if msg.Source == "" {
@@ -556,7 +560,7 @@ func runAction(msg *ProxyRequest) {
 
 		executeFunc = func(hostname string) *SshResult {
 			stdout, stderr, err := uploadFile(msg.Target, contents, hostname)
-			return &SshResult{hostname: hostname, stdout: stdout, stderr: stderr, err: err}
+			return &SshResult{id: msg.ID, hostname: hostname, stdout: stdout, stderr: stderr, err: err}
 		}
 	}
 
@@ -595,7 +599,7 @@ func runAction(msg *ProxyRequest) {
 				errMsg = msg.err.Error()
 				success = false
 			}
-			sendProxyReply(&Reply{Hostname: msg.hostname, Stdout: msg.stdout, Stderr: msg.stderr, ErrMsg: errMsg, Success: success})
+			sendProxyReply(&Reply{ID: msg.id, Hostname: msg.hostname, Stdout: msg.stdout, Stderr: msg.stderr, ErrMsg: errMsg, Success: success})
 		}
 	}
 
