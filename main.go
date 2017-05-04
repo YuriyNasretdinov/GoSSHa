@@ -159,6 +159,7 @@ func makeConfig() (config *ssh.ClientConfig, agentUnixSock net.Conn) {
 	config = &ssh.ClientConfig{
 		User: user,
 		Auth: clientAuth,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 
 	return
