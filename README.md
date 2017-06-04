@@ -73,7 +73,7 @@ In order to execute a certain `<command>` on remote servers (e.g. `<server1>` an
 {"Action":"ssh","Cmd":"<command>","Hosts":["<server1>","<server2>:<port2>"]}
 ```
 
-You can also set `"Timeout": <timeout>` in milliseconds (default is 30000 ms)
+You can also set `"Timeout": <timeout>` in milliseconds (default is 30000 ms) and `"Id": "<some-id>"` as string.
 
 While connections to hosts are estabilished and command results are ready you will receive one of the following messages:
 
@@ -83,6 +83,12 @@ While connections to hosts are estabilished and command results are ready you wi
 
 ```
 {"Type":"Reply","Hostname":"<hostname>","Stdout":"<command-stdout>","Stderr":"<command-stderr>","Success":true|false,"ErrMsg":"<error message>"}
+```
+
+If `Id` is defined it will be returned in the reply:
+
+```
+{"Id":"<some-id>","Type":"Reply","Hostname":"<hostname>","Stdout":"<command-stdout>","Stderr":"<command-stderr>","Success":true|false,"ErrMsg":"<error message>"}
 ```
 
 After all commands have done executing or when timeout comes you will receive the following response:
@@ -103,7 +109,7 @@ You can also upload file using the following command:
 {"Action":"scp","Source":"<source-file-path>","Target":"<target-file-path>","Hosts":[...]}
 ```
 
-You can also set `"Timeout": <timeout>` in milliseconds (default is 30000 ms) and `"MaxThroughput": <max-Bps>` in bytes per second to limit maximum bandwidth usage. In default implementation MaxThroughput cannot be less than about 50 Mbit/sec (6553600 bytes per second). If you want to be able to use less bandwidth, try increasing THROUGHPUT_SLEEP_INTERVAL or decreasing MIN_CHUNKS and CHUNK_SIZE constant values in source code.
+You can also set `"Timeout": <timeout>` in milliseconds (default is 30000 ms), `"Id": "<some-id>"` as string and `"MaxThroughput": <max-Bps>` in bytes per second to limit maximum bandwidth usage. In default implementation MaxThroughput cannot be less than about 50 Mbit/sec (6553600 bytes per second). If you want to be able to use less bandwidth, try increasing THROUGHPUT_SLEEP_INTERVAL or decreasing MIN_CHUNKS and CHUNK_SIZE constant values in source code.
 
 You will receive progress and results in exactly the same format as for command execution.
 
