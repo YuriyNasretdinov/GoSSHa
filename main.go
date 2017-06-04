@@ -44,6 +44,8 @@ var (
 	agentConnChan       = make(chan chan bool) // channel for getting "ticket" for new agent connection
 	agentConnFreeChan   = make(chan bool, 10)  // channel for freeing connections
 	sshAuthSock         string
+	maxSSHConnections   = 0     // max concurrent ssh connections. 0 means no maximum.
+	disconnectAfterUse  = false // close connection after each action.
 )
 
 type (
@@ -98,6 +100,12 @@ type (
 
 	InitializeComplete struct {
 		InitializeComplete bool
+	}
+
+	// executionRequest is used to send requests to the execution pool.
+	executionRequest struct {
+		Func func(string) *SshResult
+		Host string
 	}
 
 	DisableReportConnectedHosts bool
@@ -157,8 +165,8 @@ func makeConfig() (config *ssh.ClientConfig, agentUnixSock net.Conn) {
 	}
 
 	config = &ssh.ClientConfig{
-		User: user,
-		Auth: clientAuth,
+		User:            user,
+		Auth:            clientAuth,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 
@@ -304,6 +312,16 @@ func getConnection(hostname string) (conn *ssh.Client, err error) {
 	return
 }
 
+// closeConnection closes a connection to a connected host and removes it from connectedHosts
+func closeConnection(hostname string) {
+	connectedHostsMutex.Lock()
+	defer connectedHostsMutex.Unlock()
+	if conn, ok := connectedHosts[hostname]; ok {
+		conn.Close()
+	}
+	delete(connectedHosts, hostname)
+}
+
 func uploadFile(target string, contents []byte, hostname string) (stdout, stderr string, err error) {
 	conn, err := getConnection(hostname)
 	if err != nil {
@@ -313,6 +331,9 @@ func uploadFile(target string, contents []byte, hostname string) (stdout, stderr
 	session, err := conn.NewSession()
 	if err != nil {
 		return
+	}
+	if disconnectAfterUse {
+		defer closeConnection(hostname)
 	}
 	defer session.Close()
 
@@ -367,6 +388,9 @@ func executeCmd(cmd string, hostname string) (stdout, stderr string, err error) 
 	if err != nil {
 		return
 	}
+	if disconnectAfterUse {
+		defer closeConnection(hostname)
+	}
 	defer session.Close()
 
 	var stdoutBuf bytes.Buffer
@@ -414,6 +438,8 @@ func initialize() {
 	flag.StringVar(&pubKey, "i", "", "Optional path to public key to use")
 	flag.StringVar(&user, "l", os.Getenv("LOGNAME"), "Optional login name")
 	flag.IntVar(&maxAgentConnections, "c", MAX_OPENSSH_AGENT_CONNECTIONS, "Maximum simultaneous ssh-agent connections")
+	flag.BoolVar(&disconnectAfterUse, "d", disconnectAfterUse, "Disconnect after each action")
+	flag.IntVar(&maxSSHConnections, "m", maxSSHConnections, "Maximum simultaneous ssh connections. 0 means no maximum")
 	flag.Parse()
 
 	keys = []string{os.Getenv("HOME") + "/.ssh/id_rsa", os.Getenv("HOME") + "/.ssh/id_dsa", os.Getenv("HOME") + "/.ssh/id_ecdsa"}
@@ -509,6 +535,18 @@ func maxThroughputThread() {
 	}
 }
 
+// executor reads execution requests from a channel, performs the request and send the resulst to the responseChannel.
+func executor(done <-chan struct{}, requests <-chan executionRequest, responseChannel chan<- *SshResult) {
+	for req := range requests {
+		result := req.Func(req.Host)
+		select {
+		case responseChannel <- result:
+		case <-done:
+			return
+		}
+	}
+}
+
 func runAction(msg *ProxyRequest) {
 	var executeFunc func(string) *SshResult
 
@@ -576,13 +614,35 @@ func runAction(msg *ProxyRequest) {
 
 	sendProxyReply(EnableReportConnectedHosts(true))
 
-	for _, hostname := range msg.Hosts {
-		timedOutHosts[hostname] = true
-
-		go func(host string) {
-			responseChannel <- executeFunc(host)
-		}(hostname)
+	// Use a pool of executors/goroutines to execute commands
+	executionPoolSize := len(msg.Hosts)
+	if maxSSHConnections > 0 && maxSSHConnections < executionPoolSize {
+		executionPoolSize = maxSSHConnections
 	}
+	executionChannel := make(chan executionRequest)
+	executionPoolDone := make(chan struct{})
+	var executionPoolWG sync.WaitGroup
+	executionPoolWG.Add(executionPoolSize)
+	for i := 0; i < executionPoolSize; i++ {
+		go func() {
+			executor(executionPoolDone, executionChannel, responseChannel)
+			executionPoolWG.Done()
+		}()
+	}
+	go func() { // close channel after all executors are done
+		executionPoolWG.Wait()
+		close(executionChannel)
+	}()
+	go func() {
+		for _, hostname := range msg.Hosts {
+			select {
+			case executionChannel <- executionRequest{executeFunc, hostname}:
+				timedOutHosts[hostname] = true
+			case <-executionPoolDone:
+				return
+			}
+		}
+	}()
 
 	for i := 0; i < len(msg.Hosts); i++ {
 		select {
@@ -601,9 +661,9 @@ func runAction(msg *ProxyRequest) {
 	}
 
 finish:
-
+	close(executionPoolDone)
 	connectedHostsMutex.Lock()
-	for hostname, _ := range timedOutHosts {
+	for hostname := range timedOutHosts {
 		if conn, ok := connectedHosts[hostname]; ok {
 			conn.Close()
 		}
