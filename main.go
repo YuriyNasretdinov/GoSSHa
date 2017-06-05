@@ -549,6 +549,7 @@ func executor(done <-chan struct{}, requests <-chan executionRequest, responseCh
 
 func runAction(msg *ProxyRequest) {
 	var executeFunc func(string) *SshResult
+	var timedOutHostsMutex sync.Mutex
 
 	if msg.Action == "ssh" {
 		if msg.Cmd == "" {
@@ -611,7 +612,6 @@ func runAction(msg *ProxyRequest) {
 	timeoutChannel := time.After(time.Millisecond * time.Duration(timeout))
 
 	timedOutHosts := make(map[string]bool)
-
 	sendProxyReply(EnableReportConnectedHosts(true))
 
 	// Use a pool of executors/goroutines to execute commands
@@ -637,7 +637,9 @@ func runAction(msg *ProxyRequest) {
 		for _, hostname := range msg.Hosts {
 			select {
 			case executionChannel <- executionRequest{executeFunc, hostname}:
+				timedOutHostsMutex.Lock()
 				timedOutHosts[hostname] = true
+				timedOutHostsMutex.Unlock()
 			case <-executionPoolDone:
 				return
 			}
@@ -649,7 +651,9 @@ func runAction(msg *ProxyRequest) {
 		case <-timeoutChannel:
 			goto finish
 		case msg := <-responseChannel:
+			timedOutHostsMutex.Lock()
 			delete(timedOutHosts, msg.hostname)
+			timedOutHostsMutex.Unlock()
 			success := true
 			errMsg := ""
 			if msg.err != nil {
