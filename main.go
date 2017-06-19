@@ -157,8 +157,8 @@ func makeConfig() (config *ssh.ClientConfig, agentUnixSock net.Conn) {
 	}
 
 	config = &ssh.ClientConfig{
-		User: user,
-		Auth: clientAuth,
+		User:            user,
+		Auth:            clientAuth,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 
@@ -405,7 +405,7 @@ func agentConnectionManagerThread(maxConn int) {
 	}
 }
 
-func initialize() {
+func initialize(internalInput bool) {
 	var (
 		pubKey              string
 		maxAgentConnections int
@@ -434,8 +434,11 @@ func initialize() {
 		go agentConnectionManagerThread(maxAgentConnections)
 	}
 
-	go inputDecoder()
-	go jsonReplierThread()
+	if !internalInput {
+		go inputDecoder()
+		go jsonReplierThread()
+	}
+
 	go maxThroughputThread()
 
 	makeSigners()
@@ -651,7 +654,7 @@ func runProxy() {
 }
 
 func main() {
-	initialize()
+	initialize(false)
 	sendProxyReply(&InitializeComplete{InitializeComplete: true})
 	runProxy()
 }
