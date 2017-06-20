@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io/ioutil"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -70,6 +71,9 @@ func TestMain(m *testing.M) {
 		os.Setenv("HOME", tmpDir)
 		os.Setenv("SSH_AUTH_SOCK", "")
 
+		disconnectAfterUse = false
+		maxConnections = 0
+
 		launchGoSSHa()
 
 		return m.Run()
@@ -78,96 +82,196 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func TestBasic(t *testing.T) {
-	hostsLeft := make(map[string]*testSSHServer)
-	var slowServers []*testSSHServer
+type testResult struct {
+	hosts       map[string]*testSSHServer
+	slowServers []*testSSHServer
+	hostsLeft   map[string]struct{}
+	replies     map[string]*Reply
+}
 
-	for i := 0; i < 100; i++ {
-		srv := &testSSHServer{
-			hostname: fmt.Sprintf("test%d", i),
-		}
-
-		if i%30 == 0 {
-			srv.cmdSleep = maxTimeout * 2
-		}
-
-		if i%33 == 0 {
-			srv.acceptSleep = maxTimeout
-		}
-
-		if i%50 == 0 {
-			srv.exitStatus = 1
-		}
-
-		if srv.cmdSleep > 0 || srv.acceptSleep > 0 {
-			slowServers = append(slowServers, srv)
-		}
-
-		srv.start()
-
-		hostsLeft[srv.addr] = srv
+func injectFaults(srv *testSSHServer, i int) {
+	if i%30 == 0 {
+		srv.cmdSleep = maxTimeout * 2
 	}
 
-	req := &ProxyRequest{
-		Action:  "ssh",
-		Cmd:     "hostname",
-		Timeout: uint64(maxTimeout / 2 / time.Millisecond),
+	if i%33 == 0 {
+		srv.acceptSleep = maxTimeout
 	}
 
-	for h := range hostsLeft {
-		req.Hosts = append(req.Hosts, h)
+	if i%50 == 0 {
+		srv.exitStatus = 1
 	}
+}
 
-	requestsChan <- req
+func makeTestResult() *testResult {
+	return &testResult{
+		hostsLeft: make(map[string]struct{}),
+		hosts:     make(map[string]*testSSHServer),
+		replies:   make(map[string]*Reply),
+	}
+}
 
-	timeoutCh := time.After(maxTimeout)
+func waitReply(t *testing.T, r *testResult, timeout time.Duration) {
+	timeoutCh := time.After(timeout)
 
 	for {
 		select {
 		case reply := <-repliesChan:
 			switch reply := reply.(type) {
 			case *FinalReply:
-				if len(hostsLeft) != len(slowServers) {
-					t.Fatalf("Unexpected number of servers left: %#v", hostsLeft)
-				}
-
-				for _, h := range slowServers {
-					delete(hostsLeft, h.addr)
-				}
-
-				if len(hostsLeft) != 0 {
-					t.Fatalf("Extra servers left: %#v", hostsLeft)
-				}
 				return
 			case *Reply:
-				srv, ok := hostsLeft[reply.Hostname]
-
+				_, ok := r.hostsLeft[reply.Hostname]
 				if !ok {
 					t.Fatalf("Got reply for unknown host: %s", reply.Hostname)
 				}
+				delete(r.hostsLeft, reply.Hostname)
 
-				delete(hostsLeft, reply.Hostname)
-
-				if srv.exitStatus == 0 {
-					if !reply.Success {
-						t.Fatalf("Failed executing command for %s: %s", reply.Hostname, reply.ErrMsg)
-					}
-				} else {
-					if reply.Success {
-						t.Fatalf("Should have failed executing command for %s: %s", reply.Hostname, reply.ErrMsg)
-					}
-				}
-
-				if reply.Stdout != srv.hostname {
-					t.Fatalf("Expected 'Test', got '%s' in stdout", reply.Stdout)
-				}
-
-				if reply.Stderr != "" {
-					t.Fatalf("Expected '', got '%s' in stderr", reply.Stderr)
-				}
+				r.replies[reply.Hostname] = reply
 			}
 		case <-timeoutCh:
-			t.Fatalf("Timed out, hosts left: %#v", hostsLeft)
+			t.Fatalf("Timed out, hosts left: %#v", r.hostsLeft)
 		}
+	}
+
+	panic("unreachable")
+}
+
+func makeProxyRequest(timeout time.Duration) *ProxyRequest {
+	return &ProxyRequest{
+		Action:  "ssh",
+		Cmd:     "hostname",
+		Timeout: uint64(timeout / time.Millisecond),
+	}
+}
+
+func checkSuccess(t *testing.T, r *testResult) {
+	for _, reply := range r.replies {
+		srv := r.hosts[reply.Hostname]
+
+		if srv.exitStatus == 0 {
+			if !reply.Success {
+				t.Fatalf("Failed executing command for %s: %s", reply.Hostname, reply.ErrMsg)
+			}
+		} else {
+			if reply.Success {
+				t.Fatalf("Should have failed executing command for %s: %s", reply.Hostname, reply.ErrMsg)
+			}
+		}
+
+		if reply.Stdout != srv.hostname {
+			t.Fatalf("Expected 'Test', got '%s' in stdout", reply.Stdout)
+		}
+
+		if reply.Stderr != "" {
+			t.Fatalf("Expected '', got '%s' in stderr", reply.Stderr)
+		}
+	}
+
+	if len(r.hostsLeft) != len(r.slowServers) {
+		t.Fatalf("Unexpected number of servers left: %d", len(r.hostsLeft))
+	}
+
+	for _, h := range r.slowServers {
+		delete(r.hostsLeft, h.addr)
+	}
+
+	if len(r.hostsLeft) != 0 {
+		t.Fatalf("Extra servers left: %#v", r.hostsLeft)
+	}
+}
+
+func TestBasic(t *testing.T) {
+	r := makeTestResult()
+
+	for i := 0; i < 100; i++ {
+		srv := &testSSHServer{
+			hostname: fmt.Sprintf("test-%d", i),
+		}
+
+		injectFaults(srv, i)
+
+		if srv.cmdSleep > 0 || srv.acceptSleep > 0 {
+			r.slowServers = append(r.slowServers, srv)
+		}
+
+		srv.start()
+
+		r.hosts[srv.addr] = srv
+		r.hostsLeft[srv.addr] = struct{}{}
+	}
+
+	req := makeProxyRequest(maxTimeout / 2)
+
+	for h := range r.hostsLeft {
+		req.Hosts = append(req.Hosts, h)
+	}
+
+	requestsChan <- req
+
+	waitReply(t, r, maxTimeout)
+	checkSuccess(t, r)
+}
+
+func TestDisconnectAfterUse(t *testing.T) {
+	disconnectAfterUse = true
+	TestBasic(t)
+}
+
+func TestLimitConcurrency(t *testing.T) {
+	const (
+		maxServers           = 100
+		maxConcurrentServers = 10
+
+		tolerance = 0.1
+
+		minAnsweredServers = 50
+
+		softTimeout = maxTimeout
+		hardTimeout = softTimeout * 2
+
+		maxConcurrentServersRatio = float64(maxConcurrentServers) / float64(maxServers)
+		minAnsweredServersRatio   = float64(minAnsweredServers) / float64(maxServers)
+
+		cmdSleep = time.Duration(
+			float64(softTimeout) * (1 - tolerance) * maxConcurrentServersRatio / minAnsweredServersRatio,
+		)
+	)
+
+	maxConnections = maxConcurrentServers
+	maxAnsweredServers := int(math.Ceil(minAnsweredServers/(1-tolerance))) + 1
+
+	r := makeTestResult()
+
+	for i := 0; i < 100; i++ {
+		srv := &testSSHServer{
+			hostname: fmt.Sprintf("test-concurrency-%d", i),
+		}
+
+		srv.cmdSleep = cmdSleep
+		srv.start()
+
+		r.hosts[srv.addr] = srv
+		r.hostsLeft[srv.addr] = struct{}{}
+	}
+
+	req := makeProxyRequest(softTimeout)
+
+	for h := range r.hostsLeft {
+		req.Hosts = append(req.Hosts, h)
+	}
+
+	requestsChan <- req
+
+	waitReply(t, r, hardTimeout)
+
+	answeredServers := len(r.hosts) - len(r.hostsLeft)
+
+	if answeredServers < minAnsweredServers {
+		t.Fatalf("Too few servers responded: got %d, expected %d", answeredServers, minAnsweredServers)
+	}
+
+	if answeredServers > maxAnsweredServers {
+		t.Fatalf("Too many servers responded: got %d, expected %d", answeredServers, maxAnsweredServers)
 	}
 }

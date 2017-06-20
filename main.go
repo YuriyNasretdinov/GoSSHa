@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -21,31 +22,63 @@ import (
 )
 
 const (
-	DEFAULT_TIMEOUT               = 30000 // default timeout for operations (in milliseconds)
-	CHUNK_SIZE                    = 65536 // chunk size in bytes for scp
-	THROUGHPUT_SLEEP_INTERVAL     = 100   // how many milliseconds to sleep between writing "tickets" to channel in maxThroughputThread
-	MIN_CHUNKS                    = 10    // minimum allowed count of chunks to be sent per sleep interval
-	MIN_THROUGHPUT                = CHUNK_SIZE * MIN_CHUNKS * (1000 / THROUGHPUT_SLEEP_INTERVAL)
-	MAX_OPENSSH_AGENT_CONNECTIONS = 128 // default connection backlog for openssh
+	defaultTimeout             = 30000 // default timeout for operations (in milliseconds)
+	chunkSize                  = 65536 // chunk size in bytes for scp
+	throughputSleepInterval    = 100   // how many milliseconds to sleep between writing "tickets" to channel in maxThroughputThread
+	minChunks                  = 10    // minimum allowed count of chunks to be sent per sleep interval
+	minThroughput              = chunkSize * minChunks * (1000 / throughputSleepInterval)
+	maxOpensshAgentConnections = 128 // default connection backlog for openssh
 )
 
 var (
-	user                string
-	signers             []ssh.Signer
-	keys                []string
-	connectedHosts      map[string]*ssh.Client
-	connectedHostsMutex sync.Mutex
-	repliesChan         = make(chan interface{})
-	requestsChan        = make(chan *ProxyRequest)
-	maxThroughputChan   = make(chan bool, MIN_CHUNKS) // channel that is used for throughput limiting in scp
-	maxThroughput       uint64                        // max throughput (for scp) in bytes per second
-	maxThroughputMutex  sync.Mutex
-	agentConnChan       = make(chan chan bool) // channel for getting "ticket" for new agent connection
-	agentConnFreeChan   = make(chan bool, 10)  // channel for freeing connections
-	sshAuthSock         string
-	maxSSHConnections   = 0     // max concurrent ssh connections. 0 means no maximum.
-	disconnectAfterUse  = false // close connection after each action.
+	user         string
+	signers      []ssh.Signer
+	keys         []string
+	repliesChan  = make(chan interface{})
+	requestsChan = make(chan *ProxyRequest)
+
+	maxThroughputChan = make(chan bool, minChunks) // channel that is used for throughput limiting in scp
+
+	maxThroughput uint64 // max throughput (for scp) in bytes per second
+
+	agentConnChan      = make(chan chan bool) // channel for getting "ticket" for new agent connection
+	agentConnFreeChan  = make(chan bool, 10)  // channel for freeing connections
+	sshAuthSock        string
+	maxConnections     uint64 // max concurrent ssh connections
+	disconnectAfterUse bool   // close connection after each action
+
+	connectedHosts = connHostsMap{v: make(map[string]*ssh.Client)}
 )
+
+type connHostsMap struct {
+	mu sync.Mutex
+	v  map[string]*ssh.Client
+}
+
+func (c *connHostsMap) Get(hostname string) (v *ssh.Client, ok bool) {
+	c.mu.Lock()
+	v, ok = c.v[hostname]
+	c.mu.Unlock()
+	return v, ok
+}
+
+func (c *connHostsMap) Set(hostname string, v *ssh.Client) {
+	c.mu.Lock()
+	c.v[hostname] = v
+	c.mu.Unlock()
+}
+
+func (c *connHostsMap) Close(hostname string) error {
+	c.mu.Lock()
+	v, ok := c.v[hostname]
+	delete(c.v, hostname)
+	c.mu.Unlock()
+	if !ok {
+		return nil
+	}
+
+	return v.Close()
+}
 
 type (
 	SshResult struct {
@@ -67,7 +100,7 @@ type (
 		Source        string // source file to copy (only for Action == "scp")
 		Target        string // target file (only for Action == "scp")
 		Hosts         []string
-		Timeout       uint64 // timeout (in milliseconds), default is DEFAULT_TIMEOUT
+		Timeout       uint64 // timeout (in milliseconds), default is defaultTimeout
 		MaxThroughput uint64 // max throughput (for scp) in bytes per second, default is no limit
 	}
 
@@ -269,10 +302,8 @@ func makeSigners() {
 }
 
 func getConnection(hostname string) (conn *ssh.Client, err error) {
-	connectedHostsMutex.Lock()
-	conn = connectedHosts[hostname]
-	connectedHostsMutex.Unlock()
-	if conn != nil {
+	conn, ok := connectedHosts.Get(hostname)
+	if ok {
 		return
 	}
 
@@ -304,21 +335,8 @@ func getConnection(hostname string) (conn *ssh.Client, err error) {
 
 	sendProxyReply(&ConnectionProgress{ConnectedHost: hostname})
 
-	connectedHostsMutex.Lock()
-	connectedHosts[hostname] = conn
-	connectedHostsMutex.Unlock()
-
+	connectedHosts.Set(hostname, conn)
 	return
-}
-
-// closeConnection closes a connection to a connected host and removes it from connectedHosts
-func closeConnection(hostname string) {
-	connectedHostsMutex.Lock()
-	defer connectedHostsMutex.Unlock()
-	if conn, ok := connectedHosts[hostname]; ok {
-		conn.Close()
-	}
-	delete(connectedHosts, hostname)
 }
 
 func uploadFile(target string, contents []byte, hostname string) (stdout, stderr string, err error) {
@@ -332,7 +350,7 @@ func uploadFile(target string, contents []byte, hostname string) (stdout, stderr
 		return
 	}
 	if disconnectAfterUse {
-		defer closeConnection(hostname)
+		defer connectedHosts.Close(hostname)
 	}
 	defer session.Close()
 
@@ -352,10 +370,10 @@ func uploadFile(target string, contents []byte, hostname string) (stdout, stderr
 		return
 	}
 
-	for start, maxEnd := 0, len(contents); start < maxEnd; start += CHUNK_SIZE {
+	for start, maxEnd := 0, len(contents); start < maxEnd; start += chunkSize {
 		<-maxThroughputChan
 
-		end := start + CHUNK_SIZE
+		end := start + chunkSize
 		if end > maxEnd {
 			end = maxEnd
 		}
@@ -388,7 +406,7 @@ func executeCmd(cmd string, hostname string) (stdout, stderr string, err error) 
 		return
 	}
 	if disconnectAfterUse {
-		defer closeConnection(hostname)
+		defer connectedHosts.Close(hostname)
 	}
 	defer session.Close()
 
@@ -405,7 +423,7 @@ func executeCmd(cmd string, hostname string) (stdout, stderr string, err error) 
 }
 
 // do not allow more than maxConn simultaneous ssh-agent connections
-func agentConnectionManagerThread(maxConn int) {
+func agentConnectionManagerThread(maxConn uint64) {
 	freeConn := maxConn // free connections count
 
 	for {
@@ -415,8 +433,6 @@ func agentConnectionManagerThread(maxConn int) {
 		if freeConn <= 0 {
 			reqCh = nil
 		}
-
-		// fmt.Fprintln(os.Stderr, "Free connections: ", freeConn)
 
 		select {
 		case respChan := <-reqCh:
@@ -431,14 +447,14 @@ func agentConnectionManagerThread(maxConn int) {
 func initialize(internalInput bool) {
 	var (
 		pubKey              string
-		maxAgentConnections int
+		maxAgentConnections uint64
 	)
 
 	flag.StringVar(&pubKey, "i", "", "Optional path to public key to use")
 	flag.StringVar(&user, "l", os.Getenv("LOGNAME"), "Optional login name")
-	flag.IntVar(&maxAgentConnections, "c", MAX_OPENSSH_AGENT_CONNECTIONS, "Maximum simultaneous ssh-agent connections")
-	flag.BoolVar(&disconnectAfterUse, "d", disconnectAfterUse, "Disconnect after each action")
-	flag.IntVar(&maxSSHConnections, "m", maxSSHConnections, "Maximum simultaneous ssh connections. 0 means no maximum")
+	flag.Uint64Var(&maxAgentConnections, "c", maxOpensshAgentConnections, "Maximum simultaneous ssh-agent connections")
+	flag.BoolVar(&disconnectAfterUse, "d", false, "Disconnect after each action")
+	flag.Uint64Var(&maxConnections, "m", 0, "Maximum simultaneous connections")
 	flag.Parse()
 
 	keys = []string{os.Getenv("HOME") + "/.ssh/id_rsa", os.Getenv("HOME") + "/.ssh/id_dsa", os.Getenv("HOME") + "/.ssh/id_ecdsa"}
@@ -465,7 +481,6 @@ func initialize(internalInput bool) {
 	go maxThroughputThread()
 
 	makeSigners()
-	connectedHosts = make(map[string]*ssh.Client)
 }
 
 func jsonReplierThread() {
@@ -477,7 +492,6 @@ func jsonReplierThread() {
 		switch reply.(type) {
 		case DisableReportConnectedHosts:
 			connectionReporting = false
-
 			continue
 
 		case EnableReportConnectedHosts:
@@ -508,21 +522,15 @@ func sendProxyReply(response interface{}) {
 	repliesChan <- response
 }
 
-func debug(msg string) {
-	fmt.Fprintln(os.Stderr, msg)
-}
-
 func maxThroughputThread() {
 	for {
-		maxThroughputMutex.Lock()
-		throughput := maxThroughput
-		maxThroughputMutex.Unlock()
+		throughput := atomic.LoadUint64(&maxThroughput)
 
 		// how many chunks can be sent in specified time interval
-		chunks := throughput / CHUNK_SIZE * THROUGHPUT_SLEEP_INTERVAL / 1000
+		chunks := throughput / chunkSize * throughputSleepInterval / 1000
 
-		if chunks < MIN_CHUNKS {
-			chunks = MIN_CHUNKS
+		if chunks < minChunks {
+			chunks = minChunks
 		}
 
 		for i := uint64(0); i < chunks; i++ {
@@ -530,60 +538,43 @@ func maxThroughputThread() {
 		}
 
 		if throughput > 0 {
-			time.Sleep(THROUGHPUT_SLEEP_INTERVAL * time.Millisecond)
+			time.Sleep(throughputSleepInterval * time.Millisecond)
 		}
 	}
 }
 
-// executor reads execution requests from a channel, performs the request and send the resulst to the responseChannel.
-func executor(done <-chan struct{}, requests <-chan executionRequest, responseChannel chan<- *SshResult) {
-	for req := range requests {
-		result := req.Func(req.Host)
-		select {
-		case responseChannel <- result:
-		case <-done:
-			return
-		}
-	}
-}
-
-func runAction(msg *ProxyRequest) {
-	var executeFunc func(string) *SshResult
-	var timedOutHostsMutex sync.Mutex
-
+func getExecFunc(msg *ProxyRequest) func(string) *SshResult {
 	if msg.Action == "ssh" {
 		if msg.Cmd == "" {
 			reportCriticalErrorToUser("Empty 'Cmd'")
-			return
+			return nil
 		}
 
-		executeFunc = func(hostname string) *SshResult {
+		return func(hostname string) *SshResult {
 			stdout, stderr, err := executeCmd(msg.Cmd, hostname)
 			return &SshResult{hostname: hostname, stdout: stdout, stderr: stderr, err: err}
 		}
 	} else if msg.Action == "scp" {
 		if msg.Source == "" {
 			reportCriticalErrorToUser("Empty 'Source'")
-			return
+			return nil
 		}
 
 		if msg.Target == "" {
 			reportCriticalErrorToUser("Empty 'Target'")
-			return
+			return nil
 		}
 
-		if msg.MaxThroughput > 0 && msg.MaxThroughput < MIN_THROUGHPUT {
-			reportErrorToUser(fmt.Sprint("Minimal supported throughput is ", MIN_THROUGHPUT, " Bps"))
+		if msg.MaxThroughput > 0 && msg.MaxThroughput < minThroughput {
+			reportErrorToUser(fmt.Sprint("Minimal supported throughput is ", minThroughput, " Bps"))
 		}
 
-		maxThroughputMutex.Lock()
-		maxThroughput = msg.MaxThroughput
-		maxThroughputMutex.Unlock()
+		atomic.StoreUint64(&msg.MaxThroughput, maxThroughput)
 
 		fp, err := os.Open(msg.Source)
 		if err != nil {
 			reportCriticalErrorToUser(err.Error())
-			return
+			return nil
 		}
 
 		defer fp.Close()
@@ -591,16 +582,26 @@ func runAction(msg *ProxyRequest) {
 		contents, err := ioutil.ReadAll(fp)
 		if err != nil {
 			reportCriticalErrorToUser("Cannot read " + msg.Source + " contents: " + err.Error())
-			return
+			return nil
 		}
 
-		executeFunc = func(hostname string) *SshResult {
+		return func(hostname string) *SshResult {
 			stdout, stderr, err := uploadFile(msg.Target, contents, hostname)
 			return &SshResult{hostname: hostname, stdout: stdout, stderr: stderr, err: err}
 		}
 	}
 
-	timeout := uint64(DEFAULT_TIMEOUT)
+	reportCriticalErrorToUser(fmt.Sprintf("Unsupported action: %s", msg.Action))
+	return nil
+}
+
+func runAction(msg *ProxyRequest) {
+	execFunc := getExecFunc(msg)
+	if execFunc == nil {
+		return
+	}
+
+	timeout := uint64(defaultTimeout)
 
 	if msg.Timeout > 0 {
 		timeout = msg.Timeout
@@ -608,52 +609,32 @@ func runAction(msg *ProxyRequest) {
 
 	startTime := time.Now().UnixNano()
 
-	responseChannel := make(chan *SshResult, 10)
+	responseChannel := make(chan *SshResult, len(msg.Hosts))
 	timeoutChannel := time.After(time.Millisecond * time.Duration(timeout))
 
 	timedOutHosts := make(map[string]bool)
 	sendProxyReply(EnableReportConnectedHosts(true))
 
-	// Use a pool of executors/goroutines to execute commands
-	executionPoolSize := len(msg.Hosts)
-	if maxSSHConnections > 0 && maxSSHConnections < executionPoolSize {
-		executionPoolSize = maxSSHConnections
+	maxConcurrency := uint64(len(msg.Hosts))
+	if maxConnections > 0 {
+		maxConcurrency = maxConnections
 	}
-	executionChannel := make(chan executionRequest)
-	executionPoolDone := make(chan struct{})
-	var executionPoolWG sync.WaitGroup
-	executionPoolWG.Add(executionPoolSize)
-	for i := 0; i < executionPoolSize; i++ {
-		go func() {
-			executor(executionPoolDone, executionChannel, responseChannel)
-			executionPoolWG.Done()
-		}()
+	maxConcurrencyCh := make(chan struct{}, maxConcurrency)
+
+	for _, h := range msg.Hosts {
+		go func(h string) {
+			maxConcurrencyCh <- struct{}{}
+			defer func() { <-maxConcurrencyCh }()
+			responseChannel <- execFunc(h)
+		}(h)
 	}
-	go func() { // close channel after all executors are done
-		executionPoolWG.Wait()
-		close(executionChannel)
-	}()
-	go func() {
-		for _, hostname := range msg.Hosts {
-			select {
-			case executionChannel <- executionRequest{executeFunc, hostname}:
-				timedOutHostsMutex.Lock()
-				timedOutHosts[hostname] = true
-				timedOutHostsMutex.Unlock()
-			case <-executionPoolDone:
-				return
-			}
-		}
-	}()
 
 	for i := 0; i < len(msg.Hosts); i++ {
 		select {
 		case <-timeoutChannel:
 			goto finish
 		case msg := <-responseChannel:
-			timedOutHostsMutex.Lock()
 			delete(timedOutHosts, msg.hostname)
-			timedOutHostsMutex.Unlock()
 			success := true
 			errMsg := ""
 			if msg.err != nil {
@@ -665,16 +646,9 @@ func runAction(msg *ProxyRequest) {
 	}
 
 finish:
-	close(executionPoolDone)
-	connectedHostsMutex.Lock()
 	for hostname := range timedOutHosts {
-		if conn, ok := connectedHosts[hostname]; ok {
-			conn.Close()
-		}
-
-		delete(connectedHosts, hostname)
+		connectedHosts.Close(hostname)
 	}
-	connectedHostsMutex.Unlock()
 
 	sendProxyReply(DisableReportConnectedHosts(true))
 
