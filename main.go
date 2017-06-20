@@ -12,7 +12,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -427,8 +426,6 @@ func initialize(internalInput bool) {
 	}
 
 	sshAuthSock = os.Getenv("SSH_AUTH_SOCK")
-
-	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	if sshAuthSock != "" {
 		go agentConnectionManagerThread(maxAgentConnections)

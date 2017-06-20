@@ -1,29 +1,25 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/binary"
 	"fmt"
-	"io"
 	"io/ioutil"
-	"log"
 	"math/rand"
-	"net"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
-
-	"golang.org/x/crypto/ssh"
 )
 
-func must(err error, t *testing.T, msg string) {
+func must(err error, msg string) {
 	if err == nil {
 		return
 	}
-	t.Fatalf("%s: %s", msg, err)
+	panic(fmt.Errorf("%s: %s", msg, err))
 }
+
+const verbose = false
+
+const testUserName = "testuser"
 
 const idRsa = `-----BEGIN RSA PRIVATE KEY-----
 MIIEpAIBAAKCAQEAvly6o/1QuNw2kZ9yz80fytEDBGgHcgByPVTx5jTlBPBO8uXF
@@ -55,155 +51,67 @@ SAmEta/vUMI5a+meJBN+qWp53hUFrJHVUEroT2MJmAvodSyxcqqDGQ==
 
 const idRsaPub = `ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC+XLqj/VC43DaRn3LPzR/K0QMEaAdyAHI9VPHmNOUE8E7y5cVMEH4udE/UBRXh897Ij2ATGrvgeaAsNXEVInuurUwDYuG9kvrj55lVeBJHp2yT4t6cRX3WuFJSoXdQThitbvMMOu8XfYWWNW5psAZ0gjJzVaJLupmYtBKm9iQ/Nfu7DQVj1CM5pwDrcO7BKRJ+4GUtuVGRIDQt4Ye5avQptgYlPNFXlku9uYwVW16W4fYV/9/TVQkZerhQkbM/E0dztZUx/88ssZPnblDEkIrCPEyomJCOIgyRMXupq79EYJ8uWg5Uz0/V2JEGPA8oGR7dSVgWCXX3dP4eDdNiGJeN nasretdinov@Yuriys-iMac.local`
 
-func startSSHServer() (addr string) {
-	conf := &ssh.ServerConfig{}
-
-	k, err := ssh.ParsePrivateKey([]byte(idRsa))
-	if err != nil {
-		panic(fmt.Errorf("Could not parse private key: %s", err.Error()))
-	}
-	pub := k.PublicKey()
-
-	conf.AddHostKey(k)
-
-	// copied (with slight modifications) from ssh package test suite
-	certChecker := ssh.CertChecker{
-		IsUserAuthority: func(k ssh.PublicKey) bool {
-			return bytes.Equal(k.Marshal(), pub.Marshal())
-		},
-		UserKeyFallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			if conn.User() == "testuser" && bytes.Equal(key.Marshal(), pub.Marshal()) {
-				return nil, nil
-			}
-
-			return nil, fmt.Errorf("pubkey for %q not acceptable", conn.User())
-		},
-		IsRevoked: func(c *ssh.Certificate) bool {
-			return c.Serial == 666
-		},
-	}
-
-	conf.PublicKeyCallback = certChecker.Authenticate
-
-	list, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		panic(fmt.Errorf("Could not listen: %s", err.Error()))
-	}
-
-	go handleConnections(list, conf)
-	return list.Addr().String()
+func launchGoSSHa() {
+	initialize(true)
+	go runProxy()
 }
 
-func handleConnections(list net.Listener, conf *ssh.ServerConfig) {
-	for {
-		tcpConn, err := list.Accept()
-		if err != nil {
-			panic(fmt.Errorf("Failed to accept incoming connection: %s", err))
-		}
+func TestMain(m *testing.M) {
+	code := func() int {
+		rand.Seed(time.Now().UnixNano())
+		tmpDir := filepath.Join(os.TempDir(), fmt.Sprintf("gossha-test-%d", rand.Int()))
+		sshDir := filepath.Join(tmpDir, ".ssh")
+		must(os.MkdirAll(sshDir, 0700), "Could not create temp dir")
+		must(ioutil.WriteFile(filepath.Join(sshDir, "id_rsa"), []byte(idRsa), 0600), "Could not write test private key")
+		must(ioutil.WriteFile(filepath.Join(sshDir, "id_rsa.pub"), []byte(idRsaPub), 0600), "Could not write test public key")
+		defer os.RemoveAll(tmpDir)
 
-		sshConn, chans, reqs, err := ssh.NewServerConn(tcpConn, conf)
-		if err != nil {
-			panic(fmt.Errorf("Handshake failed: %s", err))
-		}
+		os.Setenv("LOGNAME", testUserName)
+		os.Setenv("HOME", tmpDir)
+		os.Setenv("SSH_AUTH_SOCK", "")
 
-		log.Printf("New SSH connection from %s (%s)", sshConn.RemoteAddr(), sshConn.ClientVersion())
-		go ssh.DiscardRequests(reqs)
-		go handleChannels(chans)
-	}
-}
+		launchGoSSHa()
 
-func handleChannels(chans <-chan ssh.NewChannel) {
-	for newChannel := range chans {
-		go handleChannel(newChannel)
-	}
-}
-
-type channelRequestSuccessMsg struct {
-	PeersId uint32 `sshtype:"99"` // we have no legal way of getting PeersId but go client accepts 0 perfectly fine
-}
-
-func handleChannel(newChannel ssh.NewChannel) {
-	if t := newChannel.ChannelType(); t != "session" {
-		newChannel.Reject(ssh.UnknownChannelType, fmt.Sprintf("unknown channel type: %s", t))
-		return
-	}
-
-	ch, requests, err := newChannel.Accept()
-	if err != nil {
-		log.Printf("Could not accept channel (%s)", err)
-		return
-	}
-	defer ch.Close()
-
-	go io.Copy(os.Stdout, ch)
-	go io.Copy(os.Stderr, ch.Stderr())
-
-	go func() {
-		rd := bufio.NewReader(ch)
-		for {
-			ln, err := rd.ReadString('\n')
-			if err != nil {
-				if err == io.EOF {
-					return
-				}
-				panic(fmt.Errorf("Could not read line: %s", err.Error()))
-			}
-			log.Printf("Got line from client: %s", ln)
-		}
+		return m.Run()
 	}()
 
-	for req := range requests {
-		if req.Type != "exec" {
-			panic(fmt.Errorf("Unsupported request type: %s", req.Type))
-		}
-
-		// first 4 bytes is length, ignore it
-		cmd := string(req.Payload[4:])
-
-		if cmd != "hostname" {
-			panic(fmt.Errorf("Unknown cmd: %s", cmd))
-		}
-
-		if !req.WantReply {
-			panic(fmt.Errorf("Expected that want reply is always set"))
-		}
-
-		req.Reply(true, ssh.Marshal(&channelRequestSuccessMsg{}))
-		ch.Write([]byte("Test"))
-
-		var b bytes.Buffer
-		binary.Write(&b, binary.BigEndian, uint32(0))
-		ch.SendRequest("exit-status", false, b.Bytes())
-		return
-	}
+	os.Exit(code)
 }
 
 func TestBasic(t *testing.T) {
-	rand.Seed(time.Now().UnixNano())
-	tmpDir := filepath.Join(os.TempDir(), fmt.Sprintf("gossha-test-%d", rand.Int()))
-	sshDir := filepath.Join(tmpDir, ".ssh")
+	hostsLeft := make(map[string]*testSSHServer)
+	var slowServers []*testSSHServer
 
-	must(os.MkdirAll(sshDir, 0700), t, "Could not create temp dir")
-	defer os.RemoveAll(tmpDir)
+	for i := 0; i < 100; i++ {
+		srv := &testSSHServer{
+			hostname: fmt.Sprintf("test%d", i),
+		}
 
-	must(ioutil.WriteFile(filepath.Join(sshDir, "id_rsa"), []byte(idRsa), 0600), t, "Could not write test private key")
-	must(ioutil.WriteFile(filepath.Join(sshDir, "id_rsa.pub"), []byte(idRsaPub), 0600), t, "Could not write test public key")
+		if i%30 == 0 {
+			srv.cmdSleep = maxTimeout * 2
+		}
 
-	os.Setenv("LOGNAME", "testuser")
-	os.Setenv("HOME", tmpDir)
-	os.Setenv("SSH_AUTH_SOCK", "")
+		if i%33 == 0 {
+			srv.acceptSleep = maxTimeout
+		}
 
-	initialize(true)
+		if i%50 == 0 {
+			srv.exitStatus = 1
+		}
 
-	addr := startSSHServer()
+		if srv.cmdSleep > 0 || srv.acceptSleep > 0 {
+			slowServers = append(slowServers, srv)
+		}
 
-	go runProxy()
+		srv.start()
 
-	hostsLeft := map[string]bool{addr: true}
+		hostsLeft[srv.addr] = srv
+	}
 
 	req := &ProxyRequest{
-		Action: "ssh",
-		Cmd:    "hostname",
+		Action:  "ssh",
+		Cmd:     "hostname",
+		Timeout: uint64(maxTimeout / 2 / time.Millisecond),
 	}
 
 	for h := range hostsLeft {
@@ -212,25 +120,45 @@ func TestBasic(t *testing.T) {
 
 	requestsChan <- req
 
-	timeoutCh := time.After(time.Second * 10)
+	timeoutCh := time.After(maxTimeout)
 
 	for {
 		select {
 		case reply := <-repliesChan:
 			switch reply := reply.(type) {
 			case *FinalReply:
-				if len(hostsLeft) > 0 {
-					t.Fatalf("Some hosts left: %#v", hostsLeft)
+				if len(hostsLeft) != len(slowServers) {
+					t.Fatalf("Unexpected number of servers left: %#v", hostsLeft)
+				}
+
+				for _, h := range slowServers {
+					delete(hostsLeft, h.addr)
+				}
+
+				if len(hostsLeft) != 0 {
+					t.Fatalf("Extra servers left: %#v", hostsLeft)
 				}
 				return
 			case *Reply:
-				delete(hostsLeft, reply.Hostname)
+				srv, ok := hostsLeft[reply.Hostname]
 
-				if !reply.Success {
-					t.Fatalf("Failed executing command for %s: %s", reply.Hostname, reply.ErrMsg)
+				if !ok {
+					t.Fatalf("Got reply for unknown host: %s", reply.Hostname)
 				}
 
-				if reply.Stdout != "Test" {
+				delete(hostsLeft, reply.Hostname)
+
+				if srv.exitStatus == 0 {
+					if !reply.Success {
+						t.Fatalf("Failed executing command for %s: %s", reply.Hostname, reply.ErrMsg)
+					}
+				} else {
+					if reply.Success {
+						t.Fatalf("Should have failed executing command for %s: %s", reply.Hostname, reply.ErrMsg)
+					}
+				}
+
+				if reply.Stdout != srv.hostname {
 					t.Fatalf("Expected 'Test', got '%s' in stdout", reply.Stdout)
 				}
 
